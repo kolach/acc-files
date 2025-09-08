@@ -562,7 +562,7 @@ func versionsHandler(w http.ResponseWriter, r *http.Request) {
 		// Build actions cell based on file type
 		var actionsCell string
 		if strings.ToLower(version.Attributes.FileType) == "pdf" {
-			actionsCell = fmt.Sprintf(`<a href="%s" target="_blank">👁️ View PDF</a> | <a href="%s" target="_blank">📥 Download</a>`, 
+			actionsCell = fmt.Sprintf(`<a href="%s">👁️ View PDF</a> | <a href="%s" target="_blank">📥 Download</a>`, 
 				viewerURL, downloadURL)
 		} else {
 			actionsCell = fmt.Sprintf(`<a href="%s" target="_blank">📥 Download</a>`, downloadURL)
