@@ -198,6 +198,8 @@ func main() {
 	http.HandleFunc("/token-status", tokenStatusHandler)
 	http.HandleFunc("/versions", versionsHandler)
 	http.HandleFunc("/download", downloadHandler)
+	http.HandleFunc("/viewer", viewerHandler)
+	http.HandleFunc("/pdf-proxy", pdfProxyHandler)
 
 	log.Printf("[STARTUP] Routes configured:")
 	log.Printf("[STARTUP] - / (home page)")
@@ -209,6 +211,8 @@ func main() {
 	log.Printf("[STARTUP] - /token-status (check stored token status)")
 	log.Printf("[STARTUP] - /versions (file versions)")
 	log.Printf("[STARTUP] - /download (file download)")
+	log.Printf("[STARTUP] - /viewer (PDF viewer)")
+	log.Printf("[STARTUP] - /pdf-proxy (CORS proxy for S3)")
 
 	// Try automatic authentication using stored refresh token
 	if tryAutomaticAuthentication() {
@@ -515,6 +519,7 @@ func versionsHandler(w http.ResponseWriter, r *http.Request) {
 				<th>Size</th>
 				<th>Created</th>
 				<th>Last Modified</th>
+				<th>Actions</th>
 				<th>Version ID</th>
 			</tr>
 	`, fileName, fileName, itemID, len(versions.Data))
@@ -546,11 +551,28 @@ func versionsHandler(w http.ResponseWriter, r *http.Request) {
 			url.QueryEscape(itemID),
 			version.Attributes.VersionNumber,
 			url.QueryEscape(version.Attributes.DisplayName))
+		
+		// Create viewer URL for PDF files
+		viewerURL := fmt.Sprintf("/viewer?projectId=%s&itemId=%s&versionNumber=%d&fileName=%s",
+			url.QueryEscape(projectID),
+			url.QueryEscape(itemID),
+			version.Attributes.VersionNumber,
+			url.QueryEscape(version.Attributes.DisplayName))
+		
+		// Build actions cell based on file type
+		var actionsCell string
+		if strings.ToLower(version.Attributes.FileType) == "pdf" {
+			actionsCell = fmt.Sprintf(`<a href="%s" target="_blank">👁️ View PDF</a> | <a href="%s" target="_blank">📥 Download</a>`, 
+				viewerURL, downloadURL)
+		} else {
+			actionsCell = fmt.Sprintf(`<a href="%s" target="_blank">📥 Download</a>`, downloadURL)
+		}
 
 		html += fmt.Sprintf(
 			`<tr class="%s">
 				<td>%d%s</td>
-				<td><a href="%s" target="_blank">📄 %s</a></td>
+				<td>📄 %s</td>
+				<td>%s</td>
 				<td>%s</td>
 				<td>%s</td>
 				<td>%s</td>
@@ -560,12 +582,12 @@ func versionsHandler(w http.ResponseWriter, r *http.Request) {
 			rowClass,
 			version.Attributes.VersionNumber,
 			func() string { if i == 0 { return " (Latest)" } else { return "" } }(),
-			downloadURL,
 			version.Attributes.DisplayName,
 			version.Attributes.FileType,
 			sizeStr,
 			version.Attributes.CreateTime.Format("2006-01-02 15:04:05"),
 			version.Attributes.LastModified.Format("2006-01-02 15:04:05"),
+			actionsCell,
 			version.ID,
 		)
 	}
@@ -2569,4 +2591,230 @@ func tryAutomaticAuthentication() bool {
 	token = newToken
 	log.Printf("[AUTH] Successfully authenticated using stored refresh token")
 	return true
+}
+
+func viewerHandler(w http.ResponseWriter, r *http.Request) {
+	log.Printf("[HANDLER] PDF viewer page requested from %s", r.RemoteAddr)
+	
+	projectID := r.URL.Query().Get("projectId")
+	itemID := r.URL.Query().Get("itemId")
+	versionNumber := r.URL.Query().Get("versionNumber")
+	fileName := r.URL.Query().Get("fileName")
+	
+	if projectID == "" || itemID == "" {
+		http.Error(w, "projectId and itemId parameters required", http.StatusBadRequest)
+		return
+	}
+	
+	// Build the signed URL for this file
+	downloadURLParams := fmt.Sprintf("projectId=%s&itemId=%s&fileName=%s",
+		url.QueryEscape(projectID),
+		url.QueryEscape(itemID),
+		url.QueryEscape(fileName))
+	
+	if versionNumber != "" {
+		downloadURLParams += fmt.Sprintf("&versionNumber=%s", url.QueryEscape(versionNumber))
+	}
+	
+	downloadURL := fmt.Sprintf("/download?%s", downloadURLParams)
+	
+	html := fmt.Sprintf(`
+<!doctype html>
+<html>
+<head>
+    <title>PDF Viewer - %s</title>
+    <style>
+        body { 
+            font-family: Arial, sans-serif; 
+            margin: 0; 
+            padding: 0;
+            background-color: #f5f5f5;
+        }
+        .header { 
+            padding: 15px 20px; 
+            background-color: white; 
+            border-bottom: 1px solid #ddd;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .header h2 { 
+            margin: 0 0 10px 0; 
+            color: #333;
+        }
+        .header p { 
+            margin: 5px 0; 
+            color: #666;
+        }
+        .header a { 
+            color: #007bff; 
+            text-decoration: none;
+        }
+        .header a:hover { 
+            text-decoration: underline;
+        }
+        .viewer-container {
+            position: relative;
+            height: calc(100vh - 120px);
+            margin: 20px;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            overflow: hidden;
+            background-color: white;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+        }
+        .loading-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%%;
+            height: 100%%;
+            background-color: rgba(255,255,255,0.9);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 18px;
+            color: #666;
+            z-index: 1000;
+        }
+        .pdf-embed {
+            width: 100%%;
+            height: 100%%;
+            border: none;
+        }
+        .error-message {
+            padding: 20px;
+            text-align: center;
+            color: #dc3545;
+            background-color: #f8d7da;
+            margin: 20px;
+            border-radius: 4px;
+            border: 1px solid #f5c6cb;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h2>📄 PDF Viewer</h2>
+        <p><strong>File:</strong> %s</p>
+        <p><a href="javascript:history.back()">← Back to Versions</a> | 
+           <a href="%s" target="_blank">📥 Download PDF</a></p>
+    </div>
+    
+    <div class="viewer-container">
+        <div class="loading-overlay" id="loadingOverlay">
+            🔄 Loading PDF viewer...
+        </div>
+        <embed id="pdfEmbed" class="pdf-embed" type="application/pdf" style="display: none;">
+    </div>
+
+    <script>
+        async function loadPDF() {
+            const loadingOverlay = document.getElementById('loadingOverlay');
+            const pdfEmbed = document.getElementById('pdfEmbed');
+            
+            try {
+                // First get the signed download URL from our server
+                const downloadResponse = await fetch('%s');
+                if (!downloadResponse.ok) {
+                    throw new Error('Failed to get download URL: ' + downloadResponse.statusText);
+                }
+                
+                // Get the actual signed S3 URL
+                const signedURL = downloadResponse.url;
+                
+                // Use our CORS proxy for the PDF
+                const proxyURL = '/pdf-proxy?url=' + encodeURIComponent(signedURL);
+                
+                // Set the PDF source and show it
+                pdfEmbed.src = proxyURL;
+                pdfEmbed.style.display = 'block';
+                
+                // Hide loading overlay after a short delay to allow PDF to start loading
+                setTimeout(() => {
+                    loadingOverlay.style.display = 'none';
+                }, 1500);
+                
+            } catch (error) {
+                console.error('Error loading PDF:', error);
+                loadingOverlay.innerHTML = '❌ Error loading PDF: ' + error.message + 
+                    '<br><br><a href="javascript:location.reload()">Try Again</a>';
+            }
+        }
+        
+        // Auto-load PDF when page loads
+        window.onload = function() {
+            loadPDF();
+        };
+    </script>
+</body>
+</html>`, fileName, fileName, downloadURL, downloadURL)
+	
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprint(w, html)
+}
+
+func pdfProxyHandler(w http.ResponseWriter, r *http.Request) {
+	log.Printf("[PROXY] PDF proxy request from %s", r.RemoteAddr)
+	
+	// Handle preflight CORS requests
+	if r.Method == "OPTIONS" {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	s3URL := r.URL.Query().Get("url")
+	if s3URL == "" {
+		log.Printf("[PROXY] ERROR: Missing URL parameter")
+		http.Error(w, "Missing URL parameter", http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("[PROXY] Fetching PDF from S3: %s", s3URL[:100]+"...")
+
+	// Create request to S3
+	req, err := http.NewRequest("GET", s3URL, nil)
+	if err != nil {
+		log.Printf("[PROXY] ERROR: Failed to create S3 request: %v", err)
+		http.Error(w, "Failed to create request: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Make the request with timeout
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("[PROXY] ERROR: S3 request failed: %v", err)
+		http.Error(w, "Failed to fetch PDF: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer resp.Body.Close()
+
+	log.Printf("[PROXY] S3 response status: %d", resp.StatusCode)
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("[PROXY] ERROR: S3 returned status %d", resp.StatusCode)
+		http.Error(w, fmt.Sprintf("S3 returned status %d", resp.StatusCode), resp.StatusCode)
+		return
+	}
+
+	// Set CORS headers
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+	// Set content headers
+	w.Header().Set("Content-Type", "application/pdf")
+	if contentLength := resp.Header.Get("Content-Length"); contentLength != "" {
+		w.Header().Set("Content-Length", contentLength)
+	}
+
+	// Copy the PDF content
+	bytesWritten, err := io.Copy(w, resp.Body)
+	if err != nil {
+		log.Printf("[PROXY] ERROR: Failed to copy PDF content: %v", err)
+	} else {
+		log.Printf("[PROXY] Successfully proxied %d bytes", bytesWritten)
+	}
 }
