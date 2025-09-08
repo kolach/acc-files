@@ -131,6 +131,31 @@ type ItemVersionAttribs struct {
 	StorageSize     int64     `json:"storageSize"`
 }
 
+// Version download info response structure  
+type VersionDownloadResponse struct {
+	JsonAPI       map[string]interface{} `json:"jsonapi"`
+	Links         map[string]interface{} `json:"links"`
+	Data          VersionDownloadData    `json:"data"`
+	Relationships map[string]interface{} `json:"relationships"`
+}
+
+type VersionDownloadData struct {
+	Type       string                     `json:"type"`
+	ID         string                     `json:"id"`
+	Attributes VersionDownloadAttributes  `json:"attributes"`
+}
+
+type VersionDownloadAttributes struct {
+	Name        string                 `json:"name"`
+	StorageSize int64                  `json:"storageSize"`
+	Extension   VersionDownloadExt     `json:"extension"`
+}
+
+type VersionDownloadExt struct {
+	Type string                    `json:"type"`
+	Data map[string]interface{}    `json:"data"`
+}
+
 // Global variables
 var (
 	config Config
@@ -172,6 +197,7 @@ func main() {
 	http.HandleFunc("/test-token", testTokenHandler)
 	http.HandleFunc("/token-status", tokenStatusHandler)
 	http.HandleFunc("/versions", versionsHandler)
+	http.HandleFunc("/download", downloadHandler)
 
 	log.Printf("[STARTUP] Routes configured:")
 	log.Printf("[STARTUP] - / (home page)")
@@ -182,6 +208,7 @@ func main() {
 	log.Printf("[STARTUP] - /test-token (test with custom token)")
 	log.Printf("[STARTUP] - /token-status (check stored token status)")
 	log.Printf("[STARTUP] - /versions (file versions)")
+	log.Printf("[STARTUP] - /download (file download)")
 
 	// Try automatic authentication using stored refresh token
 	if tryAutomaticAuthentication() {
@@ -432,6 +459,8 @@ func versionsHandler(w http.ResponseWriter, r *http.Request) {
 	itemID := r.URL.Query().Get("itemId")
 	fileName := r.URL.Query().Get("fileName")
 
+	log.Printf("[HANDLER] Versions page parameters - projectId: %s, itemId: %s, fileName: %s", projectID, itemID, fileName)
+
 	if projectID == "" || itemID == "" {
 		log.Printf("[HANDLER] ERROR: Missing required parameters - projectId: %s, itemId: %s", projectID, itemID)
 		http.Error(w, "projectId and itemId parameters required", http.StatusBadRequest)
@@ -462,6 +491,10 @@ func versionsHandler(w http.ResponseWriter, r *http.Request) {
 		.latest { background-color: #e8f5e8; font-weight: bold; }
 		.breadcrumb { margin: 10px 0; padding: 10px; background-color: #e9ecef; border-radius: 4px; }
 		.file-info { background-color: #f8f9fa; padding: 10px; margin: 10px 0; border-radius: 4px; }
+		.version a { text-decoration: none; color: #009900; font-weight: bold; }
+		.version a:hover { text-decoration: underline; }
+		.latest a { text-decoration: none; color: #006600; font-weight: bold; }
+		.latest a:hover { text-decoration: underline; }
 	</style>
 	</head>
 	<body>
@@ -507,10 +540,17 @@ func versionsHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		// Create download URL for this version using itemId instead of versionId
+		downloadURL := fmt.Sprintf("/download?projectId=%s&itemId=%s&versionNumber=%d&fileName=%s",
+			url.QueryEscape(projectID),
+			url.QueryEscape(itemID),
+			version.Attributes.VersionNumber,
+			url.QueryEscape(version.Attributes.DisplayName))
+
 		html += fmt.Sprintf(
 			`<tr class="%s">
 				<td>%d%s</td>
-				<td>%s</td>
+				<td><a href="%s" target="_blank">📄 %s</a></td>
 				<td>%s</td>
 				<td>%s</td>
 				<td>%s</td>
@@ -520,6 +560,7 @@ func versionsHandler(w http.ResponseWriter, r *http.Request) {
 			rowClass,
 			version.Attributes.VersionNumber,
 			func() string { if i == 0 { return " (Latest)" } else { return "" } }(),
+			downloadURL,
 			version.Attributes.DisplayName,
 			version.Attributes.FileType,
 			sizeStr,
@@ -532,6 +573,104 @@ func versionsHandler(w http.ResponseWriter, r *http.Request) {
 	html += "</table></body></html>"
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprint(w, html)
+}
+
+func downloadHandler(w http.ResponseWriter, r *http.Request) {
+	log.Printf("[HANDLER] Download requested from %s", r.RemoteAddr)
+	
+	if token == nil {
+		log.Printf("[HANDLER] ERROR: User not authenticated")
+		http.Error(w, "Not authenticated. Please login first.", http.StatusUnauthorized)
+		return
+	}
+
+	projectID := r.URL.Query().Get("projectId")
+	itemID := r.URL.Query().Get("itemId")
+	versionNumber := r.URL.Query().Get("versionNumber")
+	fileName := r.URL.Query().Get("fileName")
+
+	if projectID == "" || itemID == "" {
+		log.Printf("[HANDLER] ERROR: Missing required parameters - projectId: %s, itemId: %s", projectID, itemID)
+		http.Error(w, "projectId and itemId parameters required", http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("[HANDLER] Downloading file: %s (item: %s, version: %s)", fileName, itemID, versionNumber)
+
+	// Step 1: Get versions for the item to find the specific version with storage info
+	versions, err := getItemVersions(projectID, itemID)
+	if err != nil {
+		log.Printf("[HANDLER] ERROR: Failed to get item versions: %v", err)
+		http.Error(w, fmt.Sprintf("Failed to get item versions: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Step 2: Find the requested version and extract storage information
+	var targetVersion *ItemVersion
+	
+	for _, version := range versions.Data {
+		// If version number specified, match it; otherwise use the latest (first) version
+		if versionNumber == "" || fmt.Sprintf("%d", version.Attributes.VersionNumber) == versionNumber {
+			targetVersion = &version
+			break
+		}
+	}
+	
+	if targetVersion == nil {
+		log.Printf("[HANDLER] ERROR: Version not found")
+		http.Error(w, "Requested version not found", http.StatusNotFound)
+		return
+	}
+	
+	log.Printf("[HANDLER] Found target version %d, getting detailed info with storage...", targetVersion.Attributes.VersionNumber)
+
+	// Step 3: Get detailed version info that includes storage relationship
+	versionDetails, err := getVersionWithStorage(projectID, targetVersion.ID)
+	if err != nil {
+		log.Printf("[HANDLER] ERROR: Failed to get version storage details: %v", err)
+		http.Error(w, fmt.Sprintf("Failed to get version storage details: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Step 4: Extract storage URN from version details
+	storageURN, err := extractStorageURNFromVersion(versionDetails)
+	if err != nil {
+		log.Printf("[HANDLER] ERROR: Failed to extract storage URN: %v", err)
+		http.Error(w, fmt.Sprintf("Failed to extract storage URN: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("[HANDLER] Extracted storage URN: %s", storageURN)
+
+	// Step 5: Parse bucket and object key from storage URN
+	bucket, objectKey, err := parseStorageURN(storageURN)
+	if err != nil {
+		log.Printf("[HANDLER] ERROR: Failed to parse storage URN: %v", err)
+		http.Error(w, fmt.Sprintf("Failed to parse storage URN: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("[HANDLER] Parsed storage - bucket: %s, objectKey: %s", bucket, objectKey)
+
+	// Step 6: Get signed S3 download URL from OSS API
+	signedURL, err := getOSSSignedDownloadURL(bucket, objectKey)
+	if err != nil {
+		log.Printf("[HANDLER] ERROR: Failed to get signed download URL: %v", err)
+		http.Error(w, fmt.Sprintf("Failed to get signed download URL: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("[HANDLER] Got signed download URL, streaming file to client...")
+
+	// Step 7: Stream the file from S3 to the client
+	err = streamFileDownload(w, signedURL, fileName)
+	if err != nil {
+		log.Printf("[HANDLER] ERROR: Failed to stream file: %v", err)
+		// Don't call http.Error here as we may have already started writing the response
+		return
+	}
+
+	log.Printf("[HANDLER] Successfully streamed file: %s", fileName)
 }
 
 func testTokenHandler(w http.ResponseWriter, r *http.Request) {
@@ -1097,6 +1236,603 @@ func getItemVersions(projectID, itemID string) (*ItemVersionsResponse, error) {
 	
 	log.Printf("[API] Successfully retrieved %d versions for item", len(versions.Data))
 	return &versions, nil
+}
+
+// Get version details with storage relationships
+func getVersionWithStorage(projectID, versionID string) (map[string]interface{}, error) {
+	log.Printf("[API] Getting version details with storage for version %s in project %s", versionID, projectID)
+	
+	// Use the versions endpoint to get detailed version info including storage
+	encodedVersionID := url.QueryEscape(versionID)
+	apiURL := fmt.Sprintf("https://developer.api.autodesk.com/data/v1/projects/%s/versions/%s", projectID, encodedVersionID)
+	
+	log.Printf("[API] Requesting version details: %s", apiURL)
+	
+	resp, err := makeAuthorizedRequest(apiURL)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("[API] ERROR: Failed to read version details response: %v", err)
+		return nil, err
+	}
+
+	log.Printf("[API] Version details response (status %d): %s", resp.StatusCode, string(body))
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("[API] ERROR: Get version details failed with HTTP %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+	}
+
+	var versionDetails map[string]interface{}
+	err = json.Unmarshal(body, &versionDetails)
+	if err != nil {
+		log.Printf("[API] ERROR: Failed to parse version details response: %v", err)
+		return nil, err
+	}
+	
+	log.Printf("[API] Successfully retrieved version details with storage")
+	return versionDetails, nil
+}
+
+// Extract storage URN from version details response
+func extractStorageURNFromVersion(versionDetails map[string]interface{}) (string, error) {
+	log.Printf("[API] Extracting storage URN from version details")
+	
+	// Navigate to data.relationships.storage.data.id
+	data, ok := versionDetails["data"].(map[string]interface{})
+	if !ok {
+		return "", fmt.Errorf("no data found in version details")
+	}
+
+	relationships, ok := data["relationships"].(map[string]interface{})
+	if !ok {
+		return "", fmt.Errorf("no relationships found in version data")
+	}
+
+	storage, ok := relationships["storage"].(map[string]interface{})
+	if !ok {
+		return "", fmt.Errorf("no storage found in relationships")
+	}
+
+	storageData, ok := storage["data"].(map[string]interface{})
+	if !ok {
+		return "", fmt.Errorf("no storage data found")
+	}
+
+	storageID, ok := storageData["id"].(string)
+	if !ok {
+		return "", fmt.Errorf("no storage ID found")
+	}
+
+	log.Printf("[API] Successfully extracted storage URN: %s", storageID)
+	return storageID, nil
+}
+
+// Parse bucket and object key from storage URN  
+func parseStorageURN(storageURN string) (string, string, error) {
+	log.Printf("[API] Parsing storage URN: %s", storageURN)
+	
+	// Format: urn:adsk.objects:os.object:bucket/objectKey
+	// Example: urn:adsk.objects:os.object:wip.dm.prod/d8ac29bd-23ae-46d8-9a6d-609a024acdc4.pdf
+	
+	parts := strings.Split(storageURN, ":")
+	if len(parts) < 4 {
+		return "", "", fmt.Errorf("invalid storage URN format: %s", storageURN)
+	}
+	
+	bucketAndObject := parts[len(parts)-1] // Get the last part: bucket/objectKey
+	pathParts := strings.SplitN(bucketAndObject, "/", 2)
+	if len(pathParts) != 2 {
+		return "", "", fmt.Errorf("invalid bucket/object format: %s", bucketAndObject)
+	}
+	
+	bucket := pathParts[0]
+	objectKey := pathParts[1]
+	
+	log.Printf("[API] Parsed URN - bucket: %s, objectKey: %s", bucket, objectKey)
+	return bucket, objectKey, nil
+}
+
+// Get signed S3 download URL from OSS API
+func getOSSSignedDownloadURL(bucket, objectKey string) (string, error) {
+	log.Printf("[API] Getting signed S3 download URL for bucket: %s, objectKey: %s", bucket, objectKey)
+	
+	// Call OSS signeds3download endpoint
+	encodedObjectKey := url.QueryEscape(objectKey)
+	ossURL := fmt.Sprintf("https://developer.api.autodesk.com/oss/v2/buckets/%s/objects/%s/signeds3download", bucket, encodedObjectKey)
+	
+	log.Printf("[API] Requesting signed URL: %s", ossURL)
+	
+	resp, err := makeAuthorizedRequest(ossURL)
+	if err != nil {
+		return "", fmt.Errorf("failed to request signed URL: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read signed URL response: %v", err)
+	}
+
+	log.Printf("[API] Signed URL response (status %d): %s", resp.StatusCode, string(body))
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("signed URL request failed with HTTP %d: %s", resp.StatusCode, string(body))
+	}
+
+	var signedResponse map[string]interface{}
+	err = json.Unmarshal(body, &signedResponse)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse signed URL response: %v", err)
+	}
+
+	downloadURL, ok := signedResponse["url"].(string)
+	if !ok || downloadURL == "" {
+		return "", fmt.Errorf("no download URL found in signed response")
+	}
+
+	log.Printf("[API] Successfully got signed S3 download URL")
+	return downloadURL, nil
+}
+
+func getVersionDownloadInfo(projectID, itemID string) (*VersionDownloadResponse, error) {
+	log.Printf("[API] Getting download info for item %s in project %s using items endpoint", itemID, projectID)
+	
+	// Use the items endpoint as shown in the documentation
+	encodedItemID := url.QueryEscape(itemID)
+	apiURL := fmt.Sprintf("https://developer.api.autodesk.com/data/v1/projects/%s/items/%s", projectID, encodedItemID)
+	
+	log.Printf("[API] Trying items endpoint: %s", apiURL)
+	
+	resp, err := makeAuthorizedRequest(apiURL)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("[API] ERROR: Failed to read items response: %v", err)
+		return nil, err
+	}
+
+	log.Printf("[API] Items response (status %d): %s", resp.StatusCode, string(body))
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("[API] ERROR: Get items info failed with HTTP %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+	}
+
+	// Parse as raw JSON first to check for included versions with storage info
+	var rawResponse map[string]interface{}
+	err = json.Unmarshal(body, &rawResponse)
+	if err != nil {
+		log.Printf("[API] ERROR: Failed to parse items response as raw JSON: %v", err)
+		return nil, err
+	}
+	
+	// Check for included array which might contain version information with storage
+	if included, ok := rawResponse["included"].([]interface{}); ok && len(included) > 0 {
+		log.Printf("[API] Found %d included items, checking for version with storage", len(included))
+		
+		// Look for a version item in the included array that has storage relationships
+		for i, item := range included {
+			if itemMap, ok := item.(map[string]interface{}); ok {
+				if itemType, ok := itemMap["type"].(string); ok {
+					log.Printf("[API] Included item %d: type=%s", i, itemType)
+					
+					// Look for versions type items
+					if strings.Contains(itemType, "version") {
+						log.Printf("[API] Found version item in included: %s", itemType)
+						
+						// Check if this version has relationships with storage
+						if relationships, ok := itemMap["relationships"].(map[string]interface{}); ok {
+							log.Printf("[API] Version has relationships: %v", getMapKeys(relationships))
+							
+							if storage, ok := relationships["storage"].(map[string]interface{}); ok {
+								log.Printf("[API] Found storage relationship in included version: %v", getMapKeys(storage))
+								
+								// Convert this to our expected format - use the entire itemMap as the response
+								downloadInfo := VersionDownloadResponse{
+									Relationships: relationships,
+								}
+								
+								// Parse the version item's data correctly
+								downloadInfo.Data.Type = itemType
+								if id, ok := itemMap["id"].(string); ok {
+									downloadInfo.Data.ID = id
+								}
+								
+								// Parse attributes if available
+								if attributes, ok := itemMap["attributes"].(map[string]interface{}); ok {
+									if name, ok := attributes["name"].(string); ok {
+										downloadInfo.Data.Attributes.Name = name
+									}
+									if storageSize, ok := attributes["storageSize"].(float64); ok {
+										downloadInfo.Data.Attributes.StorageSize = int64(storageSize)
+									}
+								}
+								
+								log.Printf("[API] Successfully found storage info in included version")
+								return &downloadInfo, nil
+							}
+						} else {
+							log.Printf("[API] Version item %d has no relationships", i)
+						}
+					}
+				}
+			}
+		}
+		
+		log.Printf("[API] No version items with storage found in included array")
+	} else {
+		log.Printf("[API] No included array found in items response")
+	}
+
+	// Fallback: parse as standard response
+	var downloadInfo VersionDownloadResponse
+	err = json.Unmarshal(body, &downloadInfo)
+	if err != nil {
+		log.Printf("[API] ERROR: Failed to parse items response: %v", err)
+		return nil, err
+	}
+	
+	log.Printf("[API] Parsed relationships: %d items", len(downloadInfo.Relationships))
+	
+	log.Printf("[API] Successfully retrieved download info from items endpoint")
+	return &downloadInfo, nil
+}
+
+func getVersionDownloadInfoFromURL(apiURL string) (*VersionDownloadResponse, error) {
+	log.Printf("[API] Trying download info URL: %s", apiURL)
+	
+	resp, err := makeAuthorizedRequest(apiURL)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("[API] ERROR: Failed to read download info response: %v", err)
+		return nil, err
+	}
+
+	log.Printf("[API] Download info response (status %d): %s", resp.StatusCode, string(body))
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("[API] ERROR: Get download info failed with HTTP %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+	}
+
+	var downloadInfo VersionDownloadResponse
+	err = json.Unmarshal(body, &downloadInfo)
+	if err != nil {
+		log.Printf("[API] ERROR: Failed to parse download info response: %v", err)
+		return nil, err
+	}
+	
+	log.Printf("[API] Parsed relationships: %d items", len(downloadInfo.Relationships))
+	
+	log.Printf("[API] Successfully retrieved download info for version")
+	return &downloadInfo, nil
+}
+
+func getVersionDownloadInfoAlternative(projectID, versionID string) (*VersionDownloadResponse, error) {
+	log.Printf("[API] Trying alternative download endpoint for version %s", versionID)
+	
+	// Try the downloadable endpoint which might work better
+	encodedVersionID := url.QueryEscape(versionID)
+	apiURL := fmt.Sprintf("https://developer.api.autodesk.com/data/v1/projects/%s/versions/%s/downloadable", projectID, encodedVersionID)
+	
+	log.Printf("[API] Alternative download URL: %s", apiURL)
+	
+	resp, err := makeAuthorizedRequest(apiURL)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("[API] ERROR: Failed to read alternative download response: %v", err)
+		return nil, err
+	}
+
+	log.Printf("[API] Alternative download response (status %d): %s", resp.StatusCode, string(body))
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("[API] ERROR: Alternative download failed with HTTP %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+	}
+
+	var downloadInfo VersionDownloadResponse
+	err = json.Unmarshal(body, &downloadInfo)
+	if err != nil {
+		log.Printf("[API] ERROR: Failed to parse alternative download response: %v", err)
+		return nil, err
+	}
+	
+	log.Printf("[API] Parsed alternative relationships: %d items", len(downloadInfo.Relationships))
+	
+	log.Printf("[API] Successfully retrieved download info from alternative endpoint")
+	return &downloadInfo, nil
+}
+
+// Helper function to get map keys for debugging
+func getMapKeys(m map[string]interface{}) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+func getSignedS3DownloadURL(projectID, itemID string) (string, error) {
+	log.Printf("[API] Getting signed S3 download URL for item %s using correct ACC process", itemID)
+	
+	// Step 1: Parse raw JSON to extract storage information directly
+	encodedItemID := url.QueryEscape(itemID)
+	apiURL := fmt.Sprintf("https://developer.api.autodesk.com/data/v1/projects/%s/items/%s", projectID, encodedItemID)
+	
+	resp, err := makeAuthorizedRequest(apiURL)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	var rawResponse map[string]interface{}
+	err = json.Unmarshal(body, &rawResponse)
+	if err != nil {
+		return "", err
+	}
+	
+	// Check if this is a BIM 360/ACC file based on the extension type
+	data, ok := rawResponse["data"].(map[string]interface{})
+	if !ok {
+		return "", fmt.Errorf("no data found in version response")
+	}
+	
+	attributes, ok := data["attributes"].(map[string]interface{})
+	if !ok {
+		return "", fmt.Errorf("no attributes found in version response")
+	}
+	
+	extension, ok := attributes["extension"].(map[string]interface{})
+	if !ok {
+		return "", fmt.Errorf("no extension found in version response")
+	}
+	
+	extensionType, ok := extension["type"].(string)
+	if !ok {
+		return "", fmt.Errorf("no extension type found")
+	}
+	
+	log.Printf("[API] Extension type: %s", extensionType)
+	
+	// For BIM 360/ACC files (detected by extension type), use specialized endpoints
+	if strings.Contains(extensionType, "bim360") {
+		log.Printf("[API] Detected BIM 360/ACC file, trying BIM 360 specific download methods")
+		
+		// Extract project ID without "b." prefix for BIM 360 APIs
+		cleanProjectID := projectID
+		if strings.HasPrefix(projectID, "b.") {
+			cleanProjectID = projectID[2:]
+		}
+		
+		// Method 1: Try BIM 360 Document Management API download endpoint
+		bimDownloadURL := fmt.Sprintf("https://developer.api.autodesk.com/bim360/docs/v1/projects/%s/versions/%s/downloads", cleanProjectID, url.QueryEscape(itemID))
+		log.Printf("[API] Trying BIM 360 downloads endpoint: %s", bimDownloadURL)
+		
+		bimResp, err := makeAuthorizedRequest(bimDownloadURL)
+		if err == nil {
+			defer bimResp.Body.Close()
+			bimBody, err := io.ReadAll(bimResp.Body)
+			if err == nil {
+				log.Printf("[API] BIM 360 downloads response (status %d): %s", bimResp.StatusCode, string(bimBody))
+				
+				if bimResp.StatusCode == 200 {
+					var bimResponse map[string]interface{}
+					if json.Unmarshal(bimBody, &bimResponse) == nil {
+						// Check for download URL in various possible locations
+						if downloadURL, ok := bimResponse["url"].(string); ok && downloadURL != "" {
+							log.Printf("[API] Successfully got download URL from BIM 360 downloads")
+							return downloadURL, nil
+						}
+						if formats, ok := bimResponse["formats"].([]interface{}); ok && len(formats) > 0 {
+							if format, ok := formats[0].(map[string]interface{}); ok {
+								if downloadURL, ok := format["downloadUrl"].(string); ok && downloadURL != "" {
+									log.Printf("[API] Successfully got download URL from BIM 360 formats")
+									return downloadURL, nil
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+		
+		// Method 2: Try Construction Docs API download endpoint  
+		docsDownloadURL := fmt.Sprintf("https://developer.api.autodesk.com/construction/docs/v1/projects/%s/versions/%s/downloads", cleanProjectID, url.QueryEscape(itemID))
+		log.Printf("[API] Trying Construction Docs downloads endpoint: %s", docsDownloadURL)
+		
+		docsResp, err := makeAuthorizedRequest(docsDownloadURL)
+		if err == nil {
+			defer docsResp.Body.Close()
+			docsBody, err := io.ReadAll(docsResp.Body)
+			if err == nil {
+				log.Printf("[API] Construction Docs downloads response (status %d): %s", docsResp.StatusCode, string(docsBody))
+				
+				if docsResp.StatusCode == 200 {
+					var docsResponse map[string]interface{}
+					if json.Unmarshal(docsBody, &docsResponse) == nil {
+						if downloadURL, ok := docsResponse["url"].(string); ok && downloadURL != "" {
+							log.Printf("[API] Successfully got download URL from Construction Docs")
+							return downloadURL, nil
+						}
+						if downloadURL, ok := docsResponse["downloadUrl"].(string); ok && downloadURL != "" {
+							log.Printf("[API] Successfully got downloadUrl from Construction Docs")
+							return downloadURL, nil
+						}
+					}
+				}
+			}
+		}
+	}
+	
+	// Method 3: Try the standard APS Data Management API downloads endpoint
+	log.Printf("[API] Trying standard APS Data Management API downloads endpoint")
+	downloadsURL := fmt.Sprintf("https://developer.api.autodesk.com/data/v1/projects/%s/versions/%s/downloads", projectID, url.QueryEscape(itemID))
+	log.Printf("[API] Requesting downloads from APS endpoint: %s", downloadsURL)
+	
+	downloadsResp, err := makeAuthorizedRequest(downloadsURL)
+	if err == nil {
+		defer downloadsResp.Body.Close()
+		downloadsBody, err := io.ReadAll(downloadsResp.Body)
+		if err == nil {
+			log.Printf("[API] APS downloads response (status %d): %s", downloadsResp.StatusCode, string(downloadsBody))
+			
+			if downloadsResp.StatusCode == 200 {
+				var downloadsResponse map[string]interface{}
+				if json.Unmarshal(downloadsBody, &downloadsResponse) == nil {
+					if downloadURL, ok := downloadsResponse["url"].(string); ok && downloadURL != "" {
+						log.Printf("[API] Successfully got download URL from APS downloads")
+						return downloadURL, nil
+					}
+				}
+			}
+		}
+	}
+	
+	log.Printf("[API] All download methods failed, attempting fallback approach...")
+	
+	// For regular Data Management API files, extract storage information from relationships
+	relationships, ok := rawResponse["relationships"].(map[string]interface{})
+	if !ok {
+		log.Printf("[API] DEBUG: rawResponse keys: %v", getMapKeys(rawResponse))
+		if rawResponse["relationships"] == nil {
+			return "", fmt.Errorf("relationships is null in version response - this may be a BIM 360 file that needs different API")
+		}
+		return "", fmt.Errorf("no relationships found in version response (type: %T)", rawResponse["relationships"])
+	}
+	
+	log.Printf("[API] Found relationships with keys: %v", getMapKeys(relationships))
+	
+	storage, ok := relationships["storage"].(map[string]interface{})
+	if !ok {
+		return "", fmt.Errorf("no storage found in relationships")
+	}
+	
+	storageData, ok := storage["data"].(map[string]interface{})
+	if !ok {
+		return "", fmt.Errorf("no storage data found")
+	}
+	
+	storageID, ok := storageData["id"].(string)
+	if !ok {
+		return "", fmt.Errorf("no storage ID found")
+	}
+	
+	log.Printf("[API] Found storage ID: %s", storageID)
+	
+	// Parse bucket and object key from URN
+	// Format: urn:adsk.objects:os.object:bucket/objectKey
+	parts := strings.Split(storageID, ":")
+	if len(parts) < 4 {
+		return "", fmt.Errorf("invalid storage ID format: %s", storageID)
+	}
+	
+	bucketAndObject := parts[len(parts)-1]
+	pathParts := strings.SplitN(bucketAndObject, "/", 2)
+	if len(pathParts) != 2 {
+		return "", fmt.Errorf("invalid bucket/object format: %s", bucketAndObject)
+	}
+	
+	bucket := pathParts[0]
+	objectKey := pathParts[1]
+	
+	log.Printf("[API] Parsed bucket: %s, objectKey: %s", bucket, objectKey)
+	
+	// Generate signed S3 download URL using OSS API
+	signedURL := fmt.Sprintf("https://developer.api.autodesk.com/oss/v2/buckets/%s/objects/%s/signeds3download", bucket, url.QueryEscape(objectKey))
+	log.Printf("[API] Requesting signed URL: %s", signedURL)
+	
+	signedResp, err := makeAuthorizedRequest(signedURL)
+	if err != nil {
+		return "", fmt.Errorf("failed to get signed URL: %v", err)
+	}
+	defer signedResp.Body.Close()
+	
+	signedBody, err := io.ReadAll(signedResp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read signed URL response: %v", err)
+	}
+	
+	log.Printf("[API] Signed URL response (status %d): %s", signedResp.StatusCode, string(signedBody))
+	
+	if signedResp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("signed URL request failed with HTTP %d: %s", signedResp.StatusCode, string(signedBody))
+	}
+	
+	var signedResponse map[string]interface{}
+	err = json.Unmarshal(signedBody, &signedResponse)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse signed URL response: %v", err)
+	}
+	
+	downloadURL, ok := signedResponse["url"].(string)
+	if !ok || downloadURL == "" {
+		return "", fmt.Errorf("no download URL found in signed response")
+	}
+	
+	log.Printf("[API] Successfully got signed S3 download URL")
+	return downloadURL, nil
+}
+
+func streamFileDownload(w http.ResponseWriter, downloadURL, fileName string) error {
+	log.Printf("[DOWNLOAD] Streaming file from URL: %s", downloadURL)
+	
+	// Make request to the download URL (this is typically a pre-signed URL from Autodesk)
+	resp, err := http.Get(downloadURL)
+	if err != nil {
+		log.Printf("[DOWNLOAD] ERROR: Failed to fetch file: %v", err)
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("[DOWNLOAD] ERROR: Download failed with HTTP %d", resp.StatusCode)
+		return fmt.Errorf("download failed with HTTP %d", resp.StatusCode)
+	}
+
+	// Set headers to force download
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", fileName))
+	w.Header().Set("Content-Type", "application/octet-stream")
+	
+	// Copy content length if available
+	if resp.ContentLength > 0 {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", resp.ContentLength))
+	}
+
+	// Stream the file content to the client
+	log.Printf("[DOWNLOAD] Starting file stream...")
+	bytesWritten, err := io.Copy(w, resp.Body)
+	if err != nil {
+		log.Printf("[DOWNLOAD] ERROR: Failed to stream file content: %v", err)
+		return err
+	}
+
+	log.Printf("[DOWNLOAD] Successfully streamed %d bytes", bytesWritten)
+	return nil
 }
 
 
