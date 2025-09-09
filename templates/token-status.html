@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Token Status - 2-Legged Authentication</title>
+</head>
+<body>
+    <h1>Token Status ({{.AuthType}})</h1>
+    <p><a href="/">← Back to Home</a></p>
+    
+    {{if .HasError}}
+        <h2>❌ No Stored Token</h2>
+        <p>Error: {{.Error}}</p>
+        <p>The application will automatically obtain a new token using client credentials on the next API call.</p>
+    {{else}}
+        <h2>📊 Token Information</h2>
+        <p><strong>Authentication Type:</strong> {{.AuthType}}</p>
+        <p><strong>Access Token:</strong> {{.AccessToken}}</p>
+        <p><strong>Expires At:</strong> {{.ExpiresAt}}</p>
+        <p><strong>Status:</strong> 
+            {{if .IsExpired}}
+                ❌ EXPIRED
+            {{else}}
+                ✅ VALID
+            {{end}}
+        </p>
+        <p><strong>Time Info:</strong> 
+            {{if .IsExpired}}
+                Expired {{.SecondsExpired}} seconds ago
+            {{else}}
+                Valid for {{.SecondsUntilExpiry}} seconds
+            {{end}}
+        </p>
+        
+        <h2>🔄 Get New Token</h2>
+        <p>Click below to request a new access token using client credentials:</p>
+        <form method="POST">
+            <input type="submit" name="action" value="Get New Token">
+        </form>
+        
+        {{if .TestRequested}}
+            <h3>🔄 Requesting New Token...</h3>
+            {{if .TestError}}
+                <p>❌ <strong>Failed to get new token</strong></p>
+                <p>Error: {{.TestError}}</p>
+                <p>Please check your APS_CLIENT_ID and APS_CLIENT_SECRET environment variables.</p>
+            {{else if .TestSuccess}}
+                <p>✅ <strong>Successfully obtained new token</strong></p>
+                <p>Token expires in {{.NewTokenExpiresIn}} seconds</p>
+                <p>New access token: {{.NewAccessToken}}</p>
+                <p>Token has been saved and is now active.</p>
+            {{end}}
+        {{end}}
+    {{end}}
+    
+    <hr>
+    <h2>📝 Notes</h2>
+    <ul>
+        <li>2-legged authentication uses client credentials (no user login required)</li>
+        <li>Tokens are automatically refreshed when they expire during API calls</li>
+        <li>This authentication method is ideal for server-to-server applications</li>
+    </ul>
+</body>
+</html>

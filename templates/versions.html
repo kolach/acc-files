@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>File Versions: {{.FileName}}</title>
+    <style>
+        table { border-collapse: collapse; width: 100%; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+        th { background-color: #f2f2f2; }
+        .version { background-color: white; }
+        .latest { background-color: #e8f5e8; font-weight: bold; }
+        .breadcrumb { margin: 10px 0; padding: 10px; background-color: #e9ecef; border-radius: 4px; }
+        .file-info { background-color: #f8f9fa; padding: 10px; margin: 10px 0; border-radius: 4px; }
+        .version a { text-decoration: none; color: #009900; font-weight: bold; }
+        .version a:hover { text-decoration: underline; }
+        .latest a { text-decoration: none; color: #006600; font-weight: bold; }
+        .latest a:hover { text-decoration: underline; }
+    </style>
+</head>
+<body>
+    <h1>File Versions</h1>
+    <div class="breadcrumb">
+        <a href="javascript:history.back()">← Back to Files</a>
+    </div>
+    <div class="file-info">
+        <strong>File:</strong> {{.FileName}}<br>
+        <strong>Item ID:</strong> <small>{{.ItemID}}</small><br>
+        <strong>Total Versions:</strong> {{len .Versions}}
+    </div>
+    <table>
+        <tr>
+            <th>Version</th>
+            <th>Name</th>
+            <th>File Type</th>
+            <th>Size</th>
+            <th>Created</th>
+            <th>Last Modified</th>
+            <th>Actions</th>
+            <th>Version ID</th>
+        </tr>
+        {{range $index, $version := .Versions}}
+            <tr class="{{if eq $index 0}}latest{{else}}version{{end}}">
+                <td>{{$version.Attributes.VersionNumber}}{{if eq $index 0}} (Latest){{end}}</td>
+                <td>📄 {{$version.Attributes.DisplayName}}</td>
+                <td>{{$version.Attributes.FileType}}</td>
+                <td>{{formatFileSize $version.Attributes.StorageSize}}</td>
+                <td>{{formatTime $version.Attributes.CreateTime}}</td>
+                <td>{{formatTime $version.Attributes.LastModified}}</td>
+                <td>
+                    {{if eq (lower $version.Attributes.FileType) "pdf"}}
+                        <a href="/viewer?projectId={{$.ProjectID}}&itemId={{$.ItemID}}&versionNumber={{$version.Attributes.VersionNumber}}&fileName={{$version.Attributes.DisplayName}}">👁️ View PDF</a> | 
+                    {{end}}
+                    <a href="/download?projectId={{$.ProjectID}}&itemId={{$.ItemID}}&versionNumber={{$version.Attributes.VersionNumber}}&fileName={{$version.Attributes.DisplayName}}" target="_blank">📥 Download</a>
+                </td>
+                <td><small>{{$version.ID}}</small></td>
+            </tr>
+        {{end}}
+    </table>
+</body>
+</html>

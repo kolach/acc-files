@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Project Files with Custom Attributes</title>
+    <style>
+        table { border-collapse: collapse; width: 100%; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+        th { background-color: #f2f2f2; }
+        .folder { background-color: #f9f9f9; }
+        .folder a { text-decoration: none; color: #0066cc; font-weight: bold; }
+        .folder a:hover { text-decoration: underline; }
+        .file { background-color: white; }
+        .file a { text-decoration: none; color: #009900; font-weight: bold; }
+        .file a:hover { text-decoration: underline; }
+        .breadcrumb { margin: 10px 0; padding: 10px; background-color: #e9ecef; border-radius: 4px; }
+        .success { color: green; font-weight: bold; }
+        .error { color: red; font-style: italic; }
+    </style>
+</head>
+<body>
+    <h1>Files in Project (with Batch Custom Attributes)</h1>
+    <p><a href="/projects">← Back to Projects</a></p>
+    <div class="breadcrumb">
+        {{if .IsRootFolder}}
+            📁 Project Root
+        {{else}}
+            📁 <a href="/files?hubId={{.HubID}}&projectId={{.ProjectID}}">Project Root</a> / Current Folder
+        {{end}}
+    </div>
+    <p><strong>Debug Info:</strong> Found {{.FileCount}} files, retrieved batch attributes: {{.HasAttributes}}</p>
+    <table>
+        <tr>
+            <th>Name</th>
+            <th>Type</th>
+            <th>URN</th>
+            <th>Last Modified</th>
+            <th>Custom Attributes</th>
+        </tr>
+        {{range .Items}}
+            <tr class="{{if eq .Type "folders"}}folder{{else}}file{{end}}">
+                <td>
+                    {{if eq .Type "folders"}}
+                        <a href="/files?hubId={{$.HubID}}&projectId={{$.ProjectID}}&folderId={{.ID}}">📁 {{.Attributes.DisplayName}}</a>
+                    {{else}}
+                        <a href="/versions?projectId={{$.ProjectID}}&itemId={{.ID}}&fileName={{.Attributes.DisplayName}}">📄 {{.Attributes.DisplayName}}</a>
+                    {{end}}
+                </td>
+                <td>{{.Type}}</td>
+                <td><small>{{.ID}}</small></td>
+                <td>{{formatTime .Attributes.LastModified}}</td>
+                <td>
+                    {{if eq .Type "folders"}}
+                        <em>N/A for folders</em>
+                    {{else}}
+                        {{if .CustomAttributes}}
+                            <span class="success">{{.CustomAttributesFormatted}}</span>
+                        {{else}}
+                            <span class="error">No custom attributes in batch response</span>
+                        {{end}}
+                    {{end}}
+                </td>
+            </tr>
+        {{end}}
+    </table>
+</body>
+</html>

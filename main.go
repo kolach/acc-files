@@ -1,9 +1,11 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"github.com/joho/godotenv"
+	"html/template"
 	"io"
 	"log"
 	"net/http"
@@ -19,21 +21,21 @@ type Config struct {
 	ClientSecret string
 	RedirectURI  string
 	Port         string
+	HubID        string
+	ProjectID    string
 }
 
-// OAuth token response
+// OAuth token response for 2-legged authentication
 type TokenResponse struct {
-	AccessToken  string `json:"access_token"`
-	RefreshToken string `json:"refresh_token"`
-	TokenType    string `json:"token_type"`
-	ExpiresIn    int    `json:"expires_in"`
+	AccessToken string `json:"access_token"`
+	TokenType   string `json:"token_type"`
+	ExpiresIn   int    `json:"expires_in"`
 }
 
-// Stored token info for persistence
+// Stored token info for persistence (2-legged tokens don't have refresh tokens)
 type StoredToken struct {
-	RefreshToken string `json:"refresh_token"`
-	AccessToken  string `json:"access_token"`
-	ExpiresAt    int64  `json:"expires_at"` // Unix timestamp
+	AccessToken string `json:"access_token"`
+	ExpiresAt   int64  `json:"expires_at"` // Unix timestamp
 }
 
 // Hub response structure
@@ -158,12 +160,44 @@ type VersionDownloadExt struct {
 
 // Global variables
 var (
-	config Config
-	token  *TokenResponse
+	config    Config
+	token     *TokenResponse
+	templates *template.Template
 )
+
+// Template helper functions
+func initTemplates() {
+	funcMap := template.FuncMap{
+		"formatFileSize": formatFileSize,
+		"formatTime":     formatTime,
+		"lower":          strings.ToLower,
+	}
+
+	templates = template.Must(template.New("").Funcs(funcMap).ParseGlob("templates/*.html"))
+}
+
+func formatFileSize(size int64) string {
+	if size <= 0 {
+		return "Unknown"
+	}
+	if size > 1024*1024 {
+		return fmt.Sprintf("%.2f MB", float64(size)/(1024*1024))
+	} else if size > 1024 {
+		return fmt.Sprintf("%.2f KB", float64(size)/1024)
+	}
+	return fmt.Sprintf("%d bytes", size)
+}
+
+func formatTime(t time.Time) string {
+	return t.Format("2006-01-02 15:04:05")
+}
 
 func main() {
 	log.Printf("[STARTUP] Starting Autodesk ACC File Lister application...")
+
+	// Initialize templates
+	initTemplates()
+	log.Printf("[STARTUP] Templates initialized")
 
 	// Load .env file if it exists
 	err := godotenv.Load()
@@ -177,21 +211,27 @@ func main() {
 		ClientSecret: getEnv("APS_CLIENT_SECRET", ""),
 		RedirectURI:  getEnv("APS_REDIRECT_URI", "http://localhost:8080/callback"),
 		Port:         getEnv("PORT", "8080"),
+		HubID:        getEnv("APS_HUB_ID", "2c7da0c8-d4b7-48d1-9976-1954aedf4bae"),
+		ProjectID:    getEnv("APS_PROJECT_ID", "5e6a3c28-74d4-4d49-ab7d-7452dafe1b6d"),
 	}
 
 	if config.ClientID == "" || config.ClientSecret == "" {
 		log.Fatal("[STARTUP] FATAL: Please set APS_CLIENT_ID and APS_CLIENT_SECRET environment variables")
 	}
 
+	if config.HubID == "" || config.ProjectID == "" {
+		log.Fatal("[STARTUP] FATAL: Please set APS_HUB_ID and APS_PROJECT_ID environment variables")
+	}
+
 	log.Printf("[STARTUP] Configuration loaded:")
 	log.Printf("[STARTUP] - Client ID: %s***", config.ClientID[:8])
 	log.Printf("[STARTUP] - Redirect URI: %s", config.RedirectURI)
 	log.Printf("[STARTUP] - Port: %s", config.Port)
+	log.Printf("[STARTUP] - Hub ID: %s", config.HubID)
+	log.Printf("[STARTUP] - Project ID: %s", config.ProjectID)
 
 	// Set up HTTP routes
 	http.HandleFunc("/", homeHandler)
-	http.HandleFunc("/login", loginHandler)
-	http.HandleFunc("/callback", callbackHandler)
 	http.HandleFunc("/projects", projectsHandler)
 	http.HandleFunc("/files", filesHandler)
 	http.HandleFunc("/token-status", tokenStatusHandler)
@@ -202,23 +242,21 @@ func main() {
 
 	log.Printf("[STARTUP] Routes configured:")
 	log.Printf("[STARTUP] - / (home page)")
-	log.Printf("[STARTUP] - /login (OAuth initiation)")
-	log.Printf("[STARTUP] - /callback (OAuth callback)")
 	log.Printf("[STARTUP] - /projects (project listing)")
 	log.Printf("[STARTUP] - /files (file browser)")
-	log.Printf("[STARTUP] - /token-status (check stored token status)")
+	log.Printf("[STARTUP] - /token-status (check token status)")
 	log.Printf("[STARTUP] - /versions (file versions)")
 	log.Printf("[STARTUP] - /download (file download)")
 	log.Printf("[STARTUP] - /viewer (PDF viewer)")
 	log.Printf("[STARTUP] - /pdf-proxy (CORS proxy for S3)")
 
-	// Try automatic authentication using stored refresh token
-	if tryAutomaticAuthentication() {
-		log.Printf("[STARTUP] ✅ Automatic authentication successful - ready for Fargate!")
-		fmt.Printf("🔐 Already authenticated! You can access /projects directly\n")
+	// Get 2-legged authentication token
+	if authenticate2Legged() {
+		log.Printf("[STARTUP] ✅ 2-legged authentication successful!")
+		fmt.Printf("🔐 Authenticated using client credentials! Visit /projects to browse files\n")
 	} else {
-		log.Printf("[STARTUP] ⚠️  No stored authentication - manual login required")
-		fmt.Printf("🔑 Visit /login to authenticate and save refresh token\n")
+		log.Printf("[STARTUP] ❌ 2-legged authentication failed")
+		fmt.Printf("💥 Authentication failed! Check your APS_CLIENT_ID and APS_CLIENT_SECRET\n")
 	}
 
 	fmt.Printf("Server starting on port %s\n", config.Port)
@@ -228,222 +266,136 @@ func main() {
 }
 
 func homeHandler(w http.ResponseWriter, r *http.Request) {
-	var authStatus, actions string
-
-	if token != nil {
-		authStatus = "✅ <strong>Authenticated</strong> - Ready for Fargate deployment!"
-		actions = `
-		<p><a href="/projects">View Your Projects</a></p>
-		<p><em>Your refresh token is saved. This app can now run without user interaction.</em></p>`
-	} else {
-		authStatus = "❌ <strong>Not authenticated</strong> - Manual login required"
-		actions = `
-		<p><a href="/login">Login with Autodesk</a> (this will save your refresh token)</p>`
+	data := struct {
+		IsAuthenticated bool
+		AuthType        string
+	}{
+		IsAuthenticated: token != nil,
+		AuthType:        "2-Legged (Client Credentials)",
 	}
-
-	html := fmt.Sprintf(`
-	<html>
-	<head><title>Autodesk ACC File Lister - Refresh Token Version</title></head>
-	<body>
-		<h1>Autodesk ACC File Lister</h1>
-		<p><strong>Status:</strong> %s</p>
-		<hr>
-		<h2>How it works:</h2>
-		<ol>
-			<li><strong>First time:</strong> Click "Login" → Authorize → Refresh token saved to <code>autodesk_token.json</code></li>
-			<li><strong>Subsequent runs:</strong> App automatically uses saved refresh token (no user interaction needed)</li>
-			<li><strong>Fargate ready:</strong> Deploy with the saved token file for autonomous operation</li>
-		</ol>
-		%s
-		<hr>
-		<p><small>Refresh tokens typically don't expire, but can be invalidated by password changes or app revocation.</small></p>
-	</body>
-	</html>`, authStatus, actions)
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprint(w, html)
-}
-
-func loginHandler(w http.ResponseWriter, r *http.Request) {
-	log.Printf("[AUTH] Login initiated from %s", r.RemoteAddr)
-	log.Printf("[AUTH] Client ID: %s", config.ClientID[:8]+"***")
-	log.Printf("[AUTH] Redirect URI: %s", config.RedirectURI)
-	log.Printf("[AUTH] Requested scopes: data:read account:read")
-
-	// Generate authorization URL
-	authURL := fmt.Sprintf(
-		"https://developer.api.autodesk.com/authentication/v2/authorize?response_type=code&client_id=%s&redirect_uri=%s&scope=%s",
-		url.QueryEscape(config.ClientID),
-		url.QueryEscape(config.RedirectURI),
-		url.QueryEscape("account:read account:write bucket:create bucket:read bucket:update bucket:delete data:read data:write data:create data:search user:read user:write user-profile:read viewables:read"),
-	)
-
-	log.Printf("[AUTH] Redirecting to Autodesk authorization server")
-	http.Redirect(w, r, authURL, http.StatusTemporaryRedirect)
-}
-
-func callbackHandler(w http.ResponseWriter, r *http.Request) {
-	log.Printf("[AUTH] OAuth callback received from %s", r.RemoteAddr)
-
-	// Get authorization code from callback
-	code := r.URL.Query().Get("code")
-	if code == "" {
-		log.Printf("[AUTH] ERROR: No authorization code received in callback")
-		http.Error(w, "No authorization code received", http.StatusBadRequest)
-		return
+	if err := templates.ExecuteTemplate(w, "home.html", data); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
-
-	log.Printf("[AUTH] Authorization code received (length: %d)", len(code))
-	log.Printf("[AUTH] Exchanging authorization code for access token...")
-
-	// Exchange authorization code for access token
-	var err error
-	token, err = exchangeCodeForToken(code)
-	if err != nil {
-		log.Printf("[AUTH] ERROR: Failed to exchange code for token: %v", err)
-		http.Error(w, fmt.Sprintf("Failed to exchange code for token: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	log.Printf("[AUTH] SUCCESS: Access token obtained (expires in %d seconds)", token.ExpiresIn)
-	log.Printf("[AUTH] Token type: %s", token.TokenType)
-	if token.RefreshToken != "" {
-		log.Printf("[AUTH] Refresh token also received - saving to disk")
-		err = saveTokenToDisk(token)
-		if err != nil {
-			log.Printf("[AUTH] WARNING: Failed to save refresh token: %v", err)
-		} else {
-			log.Printf("[AUTH] Refresh token saved successfully for future use")
-		}
-	}
-
-	// Success page
-	html := `
-	<html>
-	<head><title>Authentication Success</title></head>
-	<body>
-		<h1>Authentication Successful!</h1>
-		<p>You are now authenticated with Autodesk.</p>
-		<p><a href="/projects">View Your Projects</a></p>
-	</body>
-	</html>`
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprint(w, html)
 }
 
 func projectsHandler(w http.ResponseWriter, r *http.Request) {
-	log.Printf("[HANDLER] Projects page requested from %s", r.RemoteAddr)
+	log.Printf("[HANDLER] Project page requested from %s", r.RemoteAddr)
 
 	if token == nil {
-		log.Printf("[HANDLER] ERROR: User not authenticated, redirecting to login")
-		http.Error(w, "Not authenticated. Please login first.", http.StatusUnauthorized)
+		log.Printf("[HANDLER] ERROR: User not authenticated")
+		http.Error(w, "Not authenticated. Please get token first.", http.StatusUnauthorized)
 		return
 	}
 
-	log.Printf("[HANDLER] User is authenticated, fetching projects data")
+	log.Printf("[HANDLER] Fetching configured project: %s in hub: %s", config.ProjectID, config.HubID)
 
-	// Get hubs first
-	hubs, err := getHubs()
+	// Get project details using hub ID and project ID
+	projectDetails, err := getProjectDetailsWithHub(config.HubID, config.ProjectID)
 	if err != nil {
-		log.Printf("[HANDLER] ERROR: Failed to get hubs: %v", err)
-		http.Error(w, fmt.Sprintf("Failed to get hubs: %v", err), http.StatusInternalServerError)
+		log.Printf("[HANDLER] ERROR: Failed to get project details: %v", err)
+		http.Error(w, fmt.Sprintf("Failed to get project details: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	html := `<html><head><title>Your Projects</title></head><body><h1>Your Hubs and Projects</h1>`
-
-	for _, hub := range hubs.Data {
-		html += fmt.Sprintf("<h2>Hub: %s</h2>", hub.Attributes.Name)
-
-		// Get projects for this hub
-		projects, err := getProjects(hub.ID)
-		if err != nil {
-			html += fmt.Sprintf("<p>Error getting projects: %v</p>", err)
-			continue
-		}
-
-		html += "<ul>"
-		for _, project := range projects.Data {
-			html += fmt.Sprintf(
-				`<li><a href="/files?hubId=%s&projectId=%s">%s</a> (ID: %s)</li>`,
-				url.QueryEscape(hub.ID),
-				url.QueryEscape(project.ID),
-				project.Attributes.Name,
-				project.ID,
-			)
-		}
-		html += "</ul>"
+	// Get root folder for the project using hub ID
+	rootFolderID, err := getProjectRootFolder(config.HubID, config.ProjectID)
+	if err != nil {
+		log.Printf("[HANDLER] ERROR: Failed to get root folder: %v", err)
+		http.Error(w, fmt.Sprintf("Failed to get root folder: %v", err), http.StatusInternalServerError)
+		return
 	}
 
-	html += "</body></html>"
+	log.Printf("[HANDLER] Successfully retrieved project details and root folder")
+
+	// Prepare data for template
+	type TemplateData struct {
+		HubID           string
+		ProjectID       string
+		ProjectName     string
+		RootFolderID    string
+		ConfiguredProject string
+	}
+
+	templateData := TemplateData{
+		HubID:             config.HubID,
+		ProjectID:         config.ProjectID,
+		ProjectName:       projectDetails.Attributes.Name,
+		RootFolderID:      rootFolderID,
+		ConfiguredProject: config.ProjectID,
+	}
+
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprint(w, html)
+	if err := templates.ExecuteTemplate(w, "projects.html", templateData); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
 }
 
 func tokenStatusHandler(w http.ResponseWriter, r *http.Request) {
-	html := `<html><head><title>Token Status</title></head><body>
-	<h1>Stored Token Status</h1>
-	<p><a href="/">← Back to Home</a></p>`
+	data := struct {
+		HasError           bool
+		Error              string
+		AccessToken        string
+		AuthType           string
+		ExpiresAt          string
+		IsExpired          bool
+		SecondsExpired     int64
+		SecondsUntilExpiry int64
+		TestRequested      bool
+		TestSuccess        bool
+		TestError          string
+		NewTokenExpiresIn  int
+		NewAccessToken     string
+	}{}
 
+	// Set auth type
+	data.AuthType = "2-Legged (Client Credentials)"
+
+	// Load stored token
 	stored, err := loadTokenFromDisk()
 	if err != nil {
-		html += fmt.Sprintf(`<h2>❌ No Stored Token</h2><p>Error: %v</p>`, err)
+		data.HasError = true
+		data.Error = err.Error()
 	} else {
+		// Populate token information
 		now := time.Now().Unix()
-		accessExpired := stored.ExpiresAt <= now
+		data.AccessToken = stored.AccessToken[:20] + "..."
+		data.ExpiresAt = time.Unix(stored.ExpiresAt, 0).Format("2006-01-02 15:04:05 MST")
+		data.IsExpired = stored.ExpiresAt <= now
 
-		html += fmt.Sprintf(`<h2>📊 Token Information</h2>
-		<p><strong>Access Token:</strong> %s***</p>
-		<p><strong>Refresh Token:</strong> %s***</p>
-		<p><strong>Access Token Expires:</strong> %s</p>
-		<p><strong>Access Token Status:</strong> %s</p>
-		<p><strong>Time Until Expiry:</strong> %s</p>`,
-			stored.AccessToken[:20],
-			stored.RefreshToken[:20],
-			time.Unix(stored.ExpiresAt, 0).Format("2006-01-02 15:04:05 MST"),
-			func() string {
-				if accessExpired {
-					return "❌ EXPIRED"
-				}
-				return "✅ VALID"
-			}(),
-			func() string {
-				diff := stored.ExpiresAt - now
-				if diff <= 0 {
-					return fmt.Sprintf("Expired %d seconds ago", -diff)
-				}
-				return fmt.Sprintf("%d seconds", diff)
-			}())
-
-		html += `<h2>🧪 Test Refresh Token</h2>
-		<form method="POST">
-			<input type="submit" name="action" value="Test Refresh Token">
-		</form>`
+		if data.IsExpired {
+			data.SecondsExpired = now - stored.ExpiresAt
+		} else {
+			data.SecondsUntilExpiry = stored.ExpiresAt - now
+		}
 	}
 
-	if r.Method == "POST" && r.FormValue("action") == "Test Refresh Token" {
-		stored, err := loadTokenFromDisk()
+	// Handle test new token request
+	if r.Method == "POST" && r.FormValue("action") == "Get New Token" {
+		data.TestRequested = true
+
+		newToken, err := getClientCredentialsToken()
 		if err != nil {
-			html += "<h3>❌ Cannot test - no stored token</h3>"
+			data.TestError = err.Error()
 		} else {
-			html += `<h3>🔄 Testing Refresh Token...</h3>`
-			newToken, err := refreshAccessToken(stored.RefreshToken)
-			if err != nil {
-				html += fmt.Sprintf(`<p>❌ <strong>Refresh token INVALID or EXPIRED</strong></p>
-				<p>Error: %v</p>
-				<p>You need to re-authenticate via <a href="/login">/login</a></p>`, err)
-			} else {
-				html += fmt.Sprintf(`<p>✅ <strong>Refresh token is VALID</strong></p>
-				<p>Successfully got new access token (expires in %d seconds)</p>
-				<p>New access token: %s***</p>`,
-					newToken.ExpiresIn, newToken.AccessToken[:20])
+			data.TestSuccess = true
+			data.NewTokenExpiresIn = newToken.ExpiresIn
+			data.NewAccessToken = newToken.AccessToken[:20] + "..."
+
+			// Update global token and save to disk
+			token = newToken
+			saveErr := saveTokenToDisk(newToken)
+			if saveErr != nil {
+				data.TestError = "Token obtained but failed to save: " + saveErr.Error()
 			}
 		}
 	}
 
-	html += `</body></html>`
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprint(w, html)
+	if err := templates.ExecuteTemplate(w, "token-status.html", data); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
 }
 
 func versionsHandler(w http.ResponseWriter, r *http.Request) {
@@ -479,124 +431,23 @@ func versionsHandler(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[HANDLER] Successfully retrieved %d versions for item", len(versions.Data))
 
-	// Build HTML response
-	html := fmt.Sprintf(`
-	<html>
-	<head><title>File Versions: %s</title>
-	<style>
-		table { border-collapse: collapse; width: 100%%; }
-		th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
-		th { background-color: #f2f2f2; }
-		.version { background-color: white; }
-		.latest { background-color: #e8f5e8; font-weight: bold; }
-		.breadcrumb { margin: 10px 0; padding: 10px; background-color: #e9ecef; border-radius: 4px; }
-		.file-info { background-color: #f8f9fa; padding: 10px; margin: 10px 0; border-radius: 4px; }
-		.version a { text-decoration: none; color: #009900; font-weight: bold; }
-		.version a:hover { text-decoration: underline; }
-		.latest a { text-decoration: none; color: #006600; font-weight: bold; }
-		.latest a:hover { text-decoration: underline; }
-	</style>
-	</head>
-	<body>
-		<h1>File Versions</h1>
-		<div class="breadcrumb">
-			<a href="javascript:history.back()">← Back to Files</a>
-		</div>
-		<div class="file-info">
-			<strong>File:</strong> %s<br>
-			<strong>Item ID:</strong> <small>%s</small><br>
-			<strong>Total Versions:</strong> %d
-		</div>
-		<table>
-			<tr>
-				<th>Version</th>
-				<th>Name</th>
-				<th>File Type</th>
-				<th>Size</th>
-				<th>Created</th>
-				<th>Last Modified</th>
-				<th>Actions</th>
-				<th>Version ID</th>
-			</tr>
-	`, fileName, fileName, itemID, len(versions.Data))
-
-	// Sort versions by version number (descending - newest first)
-	for i, version := range versions.Data {
-		var rowClass string
-		if i == 0 {
-			rowClass = "latest" // Highlight latest version
-		} else {
-			rowClass = "version"
-		}
-
-		// Format file size
-		sizeStr := "Unknown"
-		if version.Attributes.StorageSize > 0 {
-			if version.Attributes.StorageSize > 1024*1024 {
-				sizeStr = fmt.Sprintf("%.2f MB", float64(version.Attributes.StorageSize)/(1024*1024))
-			} else if version.Attributes.StorageSize > 1024 {
-				sizeStr = fmt.Sprintf("%.2f KB", float64(version.Attributes.StorageSize)/1024)
-			} else {
-				sizeStr = fmt.Sprintf("%d bytes", version.Attributes.StorageSize)
-			}
-		}
-
-		// Create download URL for this version using itemId instead of versionId
-		downloadURL := fmt.Sprintf("/download?projectId=%s&itemId=%s&versionNumber=%d&fileName=%s",
-			url.QueryEscape(projectID),
-			url.QueryEscape(itemID),
-			version.Attributes.VersionNumber,
-			url.QueryEscape(version.Attributes.DisplayName))
-
-		// Create viewer URL for PDF files
-		viewerURL := fmt.Sprintf("/viewer?projectId=%s&itemId=%s&versionNumber=%d&fileName=%s",
-			url.QueryEscape(projectID),
-			url.QueryEscape(itemID),
-			version.Attributes.VersionNumber,
-			url.QueryEscape(version.Attributes.DisplayName))
-
-		// Build actions cell based on file type
-		var actionsCell string
-		if strings.ToLower(version.Attributes.FileType) == "pdf" {
-			actionsCell = fmt.Sprintf(`<a href="%s">👁️ View PDF</a> | <a href="%s" target="_blank">📥 Download</a>`,
-				viewerURL, downloadURL)
-		} else {
-			actionsCell = fmt.Sprintf(`<a href="%s" target="_blank">📥 Download</a>`, downloadURL)
-		}
-
-		html += fmt.Sprintf(
-			`<tr class="%s">
-				<td>%d%s</td>
-				<td>📄 %s</td>
-				<td>%s</td>
-				<td>%s</td>
-				<td>%s</td>
-				<td>%s</td>
-				<td>%s</td>
-				<td><small>%s</small></td>
-			</tr>`,
-			rowClass,
-			version.Attributes.VersionNumber,
-			func() string {
-				if i == 0 {
-					return " (Latest)"
-				} else {
-					return ""
-				}
-			}(),
-			version.Attributes.DisplayName,
-			version.Attributes.FileType,
-			sizeStr,
-			version.Attributes.CreateTime.Format("2006-01-02 15:04:05"),
-			version.Attributes.LastModified.Format("2006-01-02 15:04:05"),
-			actionsCell,
-			version.ID,
-		)
+	// Prepare data for template
+	data := struct {
+		FileName  string
+		ItemID    string
+		ProjectID string
+		Versions  []ItemVersion
+	}{
+		FileName:  fileName,
+		ItemID:    itemID,
+		ProjectID: projectID,
+		Versions:  versions.Data,
 	}
 
-	html += "</table></body></html>"
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprint(w, html)
+	if err := templates.ExecuteTemplate(w, "versions.html", data); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
 }
 
 func downloadHandler(w http.ResponseWriter, r *http.Request) {
@@ -701,20 +552,16 @@ func filesHandler(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[HANDLER] Files page requested from %s", r.RemoteAddr)
 
 	if token == nil {
-		log.Printf("[HANDLER] ERROR: User not authenticated, redirecting to login")
-		http.Error(w, "Not authenticated. Please login first.", http.StatusUnauthorized)
+		log.Printf("[HANDLER] ERROR: User not authenticated")
+		http.Error(w, "Not authenticated. Please get token first.", http.StatusUnauthorized)
 		return
 	}
 
-	hubID := r.URL.Query().Get("hubId")
-	projectID := r.URL.Query().Get("projectId")
+	// Use configured project ID
+	projectID := config.ProjectID
 	folderID := r.URL.Query().Get("folderId")
 
-	if hubID == "" || projectID == "" {
-		log.Printf("[HANDLER] ERROR: Missing required parameters - hubId: %s, projectId: %s", hubID, projectID)
-		http.Error(w, "hubId and projectId parameters required", http.StatusBadRequest)
-		return
-	}
+	log.Printf("[HANDLER] Using configured project: %s, folder: %s", projectID, folderID)
 
 	var targetFolderID string
 	var err error
@@ -723,9 +570,9 @@ func filesHandler(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[HANDLER] Navigating to specific folder: %s in project %s", folderID, projectID)
 		targetFolderID = folderID
 	} else {
-		log.Printf("[HANDLER] Getting root folder for project %s in hub %s", projectID, hubID)
+		log.Printf("[HANDLER] Getting root folder for project %s", projectID)
 		// Get project root folder
-		targetFolderID, err = getProjectRootFolder(hubID, projectID)
+		targetFolderID, err = getProjectRootFolderDirect(projectID)
 		if err != nil {
 			log.Printf("[HANDLER] ERROR: Failed to get root folder: %v", err)
 			http.Error(w, fmt.Sprintf("Failed to get root folder: %v", err), http.StatusInternalServerError)
@@ -747,12 +594,9 @@ func filesHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Collect URNs for all files (non-folders) in this folder
 	var fileURNs []string
-	var fileItems []FolderItem
-
 	for _, item := range contents.Data {
 		if item.Type != "folders" {
 			fileURNs = append(fileURNs, item.ID)
-			fileItems = append(fileItems, item)
 			log.Printf("[HANDLER] Found file URN: %s (%s)", item.ID, item.Attributes.DisplayName)
 		}
 	}
@@ -769,107 +613,104 @@ func filesHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Build navigation breadcrumb
-	var breadcrumb string
-	if folderID == "" {
-		breadcrumb = "📁 Project Root"
-	} else {
-		breadcrumb = fmt.Sprintf(`📁 <a href="/files?hubId=%s&projectId=%s">Project Root</a> / Current Folder`,
-			url.QueryEscape(hubID), url.QueryEscape(projectID))
+	// Prepare enhanced items with custom attributes
+	type EnhancedFolderItem struct {
+		FolderItem
+		CustomAttributes          bool
+		CustomAttributesFormatted string
 	}
 
-	// Display files
-	html := fmt.Sprintf(`
-	<html>
-	<head><title>Project Files with Custom Attributes</title>
-	<style>
-		table { border-collapse: collapse; width: 100%%; }
-		th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
-		th { background-color: #f2f2f2; }
-		.folder { background-color: #f9f9f9; }
-		.folder a { text-decoration: none; color: #0066cc; font-weight: bold; }
-		.folder a:hover { text-decoration: underline; }
-		.file { background-color: white; }
-		.file a { text-decoration: none; color: #009900; font-weight: bold; }
-		.file a:hover { text-decoration: underline; }
-		.breadcrumb { margin: 10px 0; padding: 10px; background-color: #e9ecef; border-radius: 4px; }
-		.success { color: green; font-weight: bold; }
-		.error { color: red; font-style: italic; }
-	</style>
-	</head>
-	<body>
-		<h1>Files in Project (with Batch Custom Attributes)</h1>
-		<p><a href="/projects">← Back to Projects</a></p>
-		<div class="breadcrumb">%s</div>
-		<p><strong>Debug Info:</strong> Found %d files, retrieved batch attributes: %v</p>
-		<table>
-			<tr>
-				<th>Name</th>
-				<th>Type</th>
-				<th>URN</th>
-				<th>Last Modified</th>
-				<th>Custom Attributes</th>
-			</tr>
-	`, breadcrumb, len(fileURNs), len(batchCustomAttributes) > 0)
-
+	var enhancedItems []EnhancedFolderItem
 	for _, item := range contents.Data {
-		var nameCell, rowClass, attributesCell string
+		enhanced := EnhancedFolderItem{FolderItem: item}
 
-		if item.Type == "folders" {
-			// Make folders clickable
-			folderURL := fmt.Sprintf("/files?hubId=%s&projectId=%s&folderId=%s",
-				url.QueryEscape(hubID),
-				url.QueryEscape(projectID),
-				url.QueryEscape(item.ID))
-
-			nameCell = fmt.Sprintf(`<a href="%s">📁 %s</a>`, folderURL, item.Attributes.DisplayName)
-			rowClass = "folder"
-			attributesCell = "<em>N/A for folders</em>"
-		} else {
-			// Regular files - make them clickable to view versions
-			versionsURL := fmt.Sprintf("/versions?projectId=%s&itemId=%s&fileName=%s",
-				url.QueryEscape(projectID),
-				url.QueryEscape(item.ID),
-				url.QueryEscape(item.Attributes.DisplayName))
-
-			nameCell = fmt.Sprintf(`<a href="%s">📄 %s</a>`, versionsURL, item.Attributes.DisplayName)
-			rowClass = "file"
-
-			// Check if we have custom attributes for this file from batch request
+		if item.Type != "folders" {
 			if fileAttrs, exists := batchCustomAttributes[item.ID]; exists {
 				log.Printf("[HANDLER] SUCCESS: Found batch custom attributes for %s", item.Attributes.DisplayName)
-				attributesCell = fmt.Sprintf(`<span class="success">%s</span>`, formatCustomAttributesFromBatch(fileAttrs))
+				enhanced.CustomAttributes = true
+				enhanced.CustomAttributesFormatted = formatCustomAttributesFromBatch(fileAttrs)
 			} else {
 				log.Printf("[HANDLER] No custom attributes found in batch for %s", item.Attributes.DisplayName)
-				attributesCell = `<span class="error">No custom attributes in batch response</span>`
+				enhanced.CustomAttributes = false
 			}
 		}
 
-		html += fmt.Sprintf(
-			`<tr class="%s"><td>%s</td><td>%s</td><td><small>%s</small></td><td>%s</td><td>%s</td></tr>`,
-			rowClass,
-			nameCell,
-			item.Type,
-			item.ID,
-			item.Attributes.LastModified.Format("2006-01-02 15:04:05"),
-			attributesCell,
-		)
+		enhancedItems = append(enhancedItems, enhanced)
 	}
 
-	html += "</table></body></html>"
+	// Prepare data for template
+	data := struct {
+		HubID         string
+		ProjectID     string
+		IsRootFolder  bool
+		FileCount     int
+		HasAttributes bool
+		Items         []EnhancedFolderItem
+	}{
+		HubID:         config.HubID,
+		ProjectID:     projectID,
+		IsRootFolder:  folderID == "",
+		FileCount:     len(fileURNs),
+		HasAttributes: len(batchCustomAttributes) > 0,
+		Items:         enhancedItems,
+	}
+
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprint(w, html)
+	if err := templates.ExecuteTemplate(w, "files.html", data); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
 }
 
-func exchangeCodeForToken(code string) (*TokenResponse, error) {
-	log.Printf("[AUTH] Preparing token exchange request to Autodesk")
+// 2-legged authentication using client credentials
+func authenticate2Legged() bool {
+	log.Printf("[AUTH] Starting 2-legged authentication with client credentials")
 
+	// First try to use stored token if it's still valid
+	stored, err := loadTokenFromDisk()
+	if err == nil {
+		// Check if current access token is still valid (with 5 minute buffer)
+		if stored.ExpiresAt > time.Now().Unix()+300 {
+			log.Printf("[AUTH] Using valid stored token")
+			token = &TokenResponse{
+				AccessToken: stored.AccessToken,
+				TokenType:   "Bearer",
+				ExpiresIn:   int(stored.ExpiresAt - time.Now().Unix()),
+			}
+			return true
+		}
+	}
+
+	// Get new token using client credentials
+	log.Printf("[AUTH] Getting new 2-legged token")
+	newToken, err := getClientCredentialsToken()
+	if err != nil {
+		log.Printf("[AUTH] ERROR: Failed to get 2-legged token: %v", err)
+		return false
+	}
+
+	token = newToken
+
+	// Save token to disk
+	err = saveTokenToDisk(newToken)
+	if err != nil {
+		log.Printf("[AUTH] WARNING: Failed to save token: %v", err)
+	}
+
+	return true
+}
+
+func getClientCredentialsToken() (*TokenResponse, error) {
+	log.Printf("[AUTH] Requesting 2-legged token using client credentials")
+
+	// Step 1: Create Base64 encoded credentials (CLIENT_ID:CLIENT_SECRET)
+	credentials := fmt.Sprintf("%s:%s", config.ClientID, config.ClientSecret)
+	encodedCredentials := base64.StdEncoding.EncodeToString([]byte(credentials))
+	log.Printf("[AUTH] Created Base64 encoded credentials")
+
+	// Step 2: Prepare form data
 	data := url.Values{}
-	data.Set("grant_type", "authorization_code")
-	data.Set("code", code)
-	data.Set("client_id", config.ClientID)
-	data.Set("client_secret", config.ClientSecret)
-	data.Set("redirect_uri", config.RedirectURI)
+	data.Set("grant_type", "client_credentials")
+	data.Set("scope", "data:read")
 
 	log.Printf("[AUTH] Making POST request to token endpoint")
 	req, err := http.NewRequest("POST", "https://developer.api.autodesk.com/authentication/v2/token", strings.NewReader(data.Encode()))
@@ -878,7 +719,10 @@ func exchangeCodeForToken(code string) (*TokenResponse, error) {
 		return nil, err
 	}
 
+	// Step 3: Set headers with Authorization Basic
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Authorization", "Basic "+encodedCredentials)
 
 	client := &http.Client{}
 	resp, err := client.Do(req)
@@ -897,7 +741,7 @@ func exchangeCodeForToken(code string) (*TokenResponse, error) {
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		log.Printf("[AUTH] ERROR: Token exchange failed with HTTP %d: %s", resp.StatusCode, string(body))
+		log.Printf("[AUTH] ERROR: Token request failed with HTTP %d: %s", resp.StatusCode, string(body))
 		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -908,7 +752,7 @@ func exchangeCodeForToken(code string) (*TokenResponse, error) {
 		return nil, err
 	}
 
-	log.Printf("[AUTH] Token exchange successful")
+	log.Printf("[AUTH] 2-legged token obtained successfully (expires in %d seconds)", tokenResp.ExpiresIn)
 	return &tokenResp, nil
 }
 
@@ -921,27 +765,28 @@ func makeAuthorizedRequest(url string) (*http.Response, error) {
 		return nil, err
 	}
 
-	// If we get 401 (token expired), try refreshing and retry once
+	// If we get 401 (token expired), get a new token and retry once
 	if resp.StatusCode == 401 {
-		log.Printf("[API] Access token expired (401), attempting to refresh...")
+		log.Printf("[API] Access token expired (401), getting new 2-legged token...")
 		resp.Body.Close() // Close the 401 response
 
-		// Load stored token and refresh
-		stored, err := loadTokenFromDisk()
+		// Get new token using client credentials
+		newToken, err := getClientCredentialsToken()
 		if err != nil {
-			log.Printf("[API] ERROR: Cannot load stored token for refresh: %v", err)
-			return resp, nil // Return original 401 response
-		}
-
-		newToken, err := refreshAccessToken(stored.RefreshToken)
-		if err != nil {
-			log.Printf("[API] ERROR: Failed to refresh access token: %v", err)
+			log.Printf("[API] ERROR: Failed to get new 2-legged token: %v", err)
 			return resp, nil // Return original 401 response
 		}
 
 		// Update global token
 		token = newToken
-		log.Printf("[API] Successfully refreshed token, retrying request...")
+
+		// Save new token
+		saveErr := saveTokenToDisk(newToken)
+		if saveErr != nil {
+			log.Printf("[API] WARNING: Failed to save new token: %v", saveErr)
+		}
+
+		log.Printf("[API] Successfully obtained new token, retrying request...")
 
 		// Retry the request with new token
 		return doAuthorizedRequest(url)
@@ -1032,6 +877,163 @@ func getProjects(hubID string) (*ProjectsResponse, error) {
 
 	log.Printf("[API] Successfully retrieved %d projects for hub %s", len(projects.Data), hubID)
 	return &projects, err
+}
+
+func getProjectDetails(projectID string) (*Project, error) {
+	log.Printf("[API] Fetching project details for project: %s", projectID)
+
+	url := fmt.Sprintf("https://developer.api.autodesk.com/project/v1/projects/%s", projectID)
+	resp, err := makeAuthorizedRequest(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("[API] ERROR: Failed to read project details response: %v", err)
+		return nil, err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("[API] ERROR: Get project details failed with HTTP %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+	}
+
+	// Parse the response to get project data
+	var result map[string]any
+	err = json.Unmarshal(body, &result)
+	if err != nil {
+		log.Printf("[API] ERROR: Failed to parse project details response: %v", err)
+		return nil, err
+	}
+
+	// Extract project data and convert back to Project struct
+	projectData, ok := result["data"].(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("invalid project details response format")
+	}
+
+	// Re-marshal and unmarshal to convert to Project struct
+	projectBytes, err := json.Marshal(projectData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to re-marshal project data: %v", err)
+	}
+
+	var project Project
+	err = json.Unmarshal(projectBytes, &project)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal project: %v", err)
+	}
+
+	log.Printf("[API] Successfully retrieved project details: %s", project.Attributes.Name)
+	return &project, nil
+}
+
+func getProjectDetailsWithHub(hubID, projectID string) (*Project, error) {
+	log.Printf("[API] Fetching project details for project: %s in hub: %s", projectID, hubID)
+
+	url := fmt.Sprintf("https://developer.api.autodesk.com/project/v1/hubs/%s/projects/%s", hubID, projectID)
+	resp, err := makeAuthorizedRequest(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("[API] ERROR: Failed to read project details response: %v", err)
+		return nil, err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("[API] ERROR: Get project details failed with HTTP %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+	}
+
+	// Parse the response to get project data
+	var result map[string]any
+	err = json.Unmarshal(body, &result)
+	if err != nil {
+		log.Printf("[API] ERROR: Failed to parse project details response: %v", err)
+		return nil, err
+	}
+
+	// Extract project data and convert back to Project struct
+	projectData, ok := result["data"].(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("invalid project details response format")
+	}
+
+	// Re-marshal and unmarshal to convert to Project struct
+	projectBytes, err := json.Marshal(projectData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to re-marshal project data: %v", err)
+	}
+
+	var project Project
+	err = json.Unmarshal(projectBytes, &project)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal project: %v", err)
+	}
+
+	log.Printf("[API] Successfully retrieved project details: %s", project.Attributes.Name)
+	return &project, nil
+}
+
+func getProjectRootFolderDirect(projectID string) (string, error) {
+	log.Printf("[API] Fetching root folder for project: %s", projectID)
+
+	url := fmt.Sprintf("https://developer.api.autodesk.com/project/v1/projects/%s", projectID)
+	resp, err := makeAuthorizedRequest(url)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+	}
+
+	// Parse to get root folder ID from relationships
+	var result map[string]any
+	err = json.Unmarshal(body, &result)
+	if err != nil {
+		return "", err
+	}
+
+	data, ok := result["data"].(map[string]any)
+	if !ok {
+		return "", fmt.Errorf("invalid response format")
+	}
+
+	relationships, ok := data["relationships"].(map[string]any)
+	if !ok {
+		return "", fmt.Errorf("no relationships found")
+	}
+
+	rootFolder, ok := relationships["rootFolder"].(map[string]any)
+	if !ok {
+		return "", fmt.Errorf("no rootFolder found")
+	}
+
+	folderData, ok := rootFolder["data"].(map[string]any)
+	if !ok {
+		return "", fmt.Errorf("no folder data found")
+	}
+
+	folderID, ok := folderData["id"].(string)
+	if !ok {
+		return "", fmt.Errorf("no folder ID found")
+	}
+
+	log.Printf("[API] Successfully retrieved root folder ID: %s", folderID)
+	return folderID, nil
 }
 
 func getProjectRootFolder(hubID, projectID string) (string, error) {
@@ -1437,18 +1439,18 @@ func getBatchCustomAttributes(projectID string, fileURNs []string) (map[string]a
 // Format custom attributes from batch response
 func formatCustomAttributesFromBatch(attrs any) string {
 	if attrs == nil {
-		return "<em>No custom attributes</em>"
+		return "No custom attributes"
 	}
 
 	// Handle string response
 	if str, ok := attrs.(string); ok {
-		return fmt.Sprintf("<em>%s</em>", str)
+		return str
 	}
 
 	// Handle array of custom attributes
 	if attrArray, ok := attrs.([]any); ok {
 		if len(attrArray) == 0 {
-			return "<em>No custom attributes assigned</em>"
+			return "No custom attributes assigned"
 		}
 
 		var formattedAttrs []string
@@ -1464,21 +1466,21 @@ func formatCustomAttributesFromBatch(attrs any) string {
 					value = fmt.Sprintf("%v", v)
 				}
 
-				formattedAttrs = append(formattedAttrs, fmt.Sprintf("<strong>%s:</strong> %s", name, value))
+				formattedAttrs = append(formattedAttrs, fmt.Sprintf("%s: %s", name, value))
 			}
 		}
 
 		if len(formattedAttrs) > 0 {
-			return strings.Join(formattedAttrs, "<br>")
+			return strings.Join(formattedAttrs, " | ")
 		}
 	}
 
 	// Fallback: convert to JSON string
 	jsonBytes, err := json.Marshal(attrs)
 	if err != nil {
-		return fmt.Sprintf("<em>Error formatting: %v</em>", err)
+		return fmt.Sprintf("Error formatting: %v", err)
 	}
-	return fmt.Sprintf("<pre>%s</pre>", string(jsonBytes))
+	return string(jsonBytes)
 }
 
 func getEnv(key, defaultValue string) string {
@@ -1492,9 +1494,8 @@ func getEnv(key, defaultValue string) string {
 // Token storage functions
 func saveTokenToDisk(tokenResp *TokenResponse) error {
 	stored := StoredToken{
-		RefreshToken: tokenResp.RefreshToken,
-		AccessToken:  tokenResp.AccessToken,
-		ExpiresAt:    time.Now().Unix() + int64(tokenResp.ExpiresIn),
+		AccessToken: tokenResp.AccessToken,
+		ExpiresAt:   time.Now().Unix() + int64(tokenResp.ExpiresIn),
 	}
 
 	log.Printf("[TOKEN] Saving token - expires at: %s", time.Unix(stored.ExpiresAt, 0).Format("2006-01-02 15:04:05 MST"))
@@ -1527,102 +1528,6 @@ func loadTokenFromDisk() (*StoredToken, error) {
 	return &stored, nil
 }
 
-func refreshAccessToken(refreshToken string) (*TokenResponse, error) {
-	log.Printf("[AUTH] Refreshing access token using stored refresh token...")
-	log.Printf("[AUTH] Refresh token (first 20 chars): %s***", refreshToken[:20])
-
-	data := url.Values{}
-	data.Set("grant_type", "refresh_token")
-	data.Set("refresh_token", refreshToken)
-	data.Set("client_id", config.ClientID)
-	data.Set("client_secret", config.ClientSecret)
-
-	req, err := http.NewRequest("POST", "https://developer.api.autodesk.com/authentication/v2/token", strings.NewReader(data.Encode()))
-	if err != nil {
-		log.Printf("[AUTH] ERROR: Failed to create refresh request: %v", err)
-		return nil, err
-	}
-
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Printf("[AUTH] ERROR: Refresh token request failed: %v", err)
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	log.Printf("[AUTH] Refresh token response received with status: %d", resp.StatusCode)
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		log.Printf("[AUTH] ERROR: Failed to read refresh response: %v", err)
-		return nil, err
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		log.Printf("[AUTH] ERROR: Refresh token failed with HTTP %d: %s", resp.StatusCode, string(body))
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
-	}
-
-	var tokenResp TokenResponse
-	err = json.Unmarshal(body, &tokenResp)
-	if err != nil {
-		log.Printf("[AUTH] ERROR: Failed to parse refresh response: %v", err)
-		return nil, err
-	}
-
-	log.Printf("[AUTH] Access token refreshed successfully (expires in %d seconds)", tokenResp.ExpiresIn)
-
-	// Update stored token with new access token and expiry
-	if tokenResp.RefreshToken == "" {
-		// If no new refresh token provided, keep the old one
-		tokenResp.RefreshToken = refreshToken
-	}
-
-	err = saveTokenToDisk(&tokenResp)
-	if err != nil {
-		log.Printf("[AUTH] WARNING: Failed to save refreshed token: %v", err)
-	}
-
-	return &tokenResp, nil
-}
-
-func tryAutomaticAuthentication() bool {
-	log.Printf("[AUTH] Checking for stored refresh token...")
-
-	stored, err := loadTokenFromDisk()
-	if err != nil {
-		log.Printf("[AUTH] No stored token found: %v", err)
-		return false
-	}
-
-	// Check if current access token is still valid (with 5 minute buffer)
-	if stored.ExpiresAt > time.Now().Unix()+300 {
-		log.Printf("[AUTH] Stored access token is still valid, using it")
-		token = &TokenResponse{
-			AccessToken:  stored.AccessToken,
-			RefreshToken: stored.RefreshToken,
-			TokenType:    "Bearer",
-			ExpiresIn:    int(stored.ExpiresAt - time.Now().Unix()),
-		}
-		return true
-	}
-
-	log.Printf("[AUTH] Stored access token expired, refreshing...")
-	newToken, err := refreshAccessToken(stored.RefreshToken)
-	if err != nil {
-		log.Printf("[AUTH] ERROR: Failed to refresh token: %v", err)
-		log.Printf("[AUTH] You may need to re-authenticate via /login")
-		return false
-	}
-
-	token = newToken
-	log.Printf("[AUTH] Successfully authenticated using stored refresh token")
-	return true
-}
-
 func viewerHandler(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[HANDLER] PDF viewer page requested from %s", r.RemoteAddr)
 
@@ -1636,7 +1541,7 @@ func viewerHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Build the signed URL for this file
+	// Build the download URL parameters
 	downloadURLParams := fmt.Sprintf("projectId=%s&itemId=%s&fileName=%s",
 		url.QueryEscape(projectID),
 		url.QueryEscape(itemID),
@@ -1648,138 +1553,19 @@ func viewerHandler(w http.ResponseWriter, r *http.Request) {
 
 	downloadURL := fmt.Sprintf("/download?%s", downloadURLParams)
 
-	html := fmt.Sprintf(`
-<!doctype html>
-<html>
-<head>
-    <title>PDF Viewer - %s</title>
-    <style>
-        body { 
-            font-family: Arial, sans-serif; 
-            margin: 0; 
-            padding: 0;
-            background-color: #f5f5f5;
-        }
-        .header { 
-            padding: 15px 20px; 
-            background-color: white; 
-            border-bottom: 1px solid #ddd;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        }
-        .header h2 { 
-            margin: 0 0 10px 0; 
-            color: #333;
-        }
-        .header p { 
-            margin: 5px 0; 
-            color: #666;
-        }
-        .header a { 
-            color: #007bff; 
-            text-decoration: none;
-        }
-        .header a:hover { 
-            text-decoration: underline;
-        }
-        .viewer-container {
-            position: relative;
-            height: calc(100vh - 120px);
-            margin: 20px;
-            border: 1px solid #ddd;
-            border-radius: 8px;
-            overflow: hidden;
-            background-color: white;
-            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
-        }
-        .loading-overlay {
-            position: absolute;
-            top: 0;
-            left: 0;
-            width: 100%%;
-            height: 100%%;
-            background-color: rgba(255,255,255,0.9);
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 18px;
-            color: #666;
-            z-index: 1000;
-        }
-        .pdf-embed {
-            width: 100%%;
-            height: 100%%;
-            border: none;
-        }
-        .error-message {
-            padding: 20px;
-            text-align: center;
-            color: #dc3545;
-            background-color: #f8d7da;
-            margin: 20px;
-            border-radius: 4px;
-            border: 1px solid #f5c6cb;
-        }
-    </style>
-</head>
-<body>
-    <div class="header">
-        <h2>📄 PDF Viewer</h2>
-        <p><strong>File:</strong> %s</p>
-        <p><a href="javascript:history.back()">← Back to Versions</a> | 
-           <a href="%s" target="_blank">📥 Download PDF</a></p>
-    </div>
-    
-    <div class="viewer-container">
-        <div class="loading-overlay" id="loadingOverlay">
-            🔄 Loading PDF viewer...
-        </div>
-        <embed id="pdfEmbed" class="pdf-embed" type="application/pdf" style="display: none;">
-    </div>
-
-    <script>
-        async function loadPDF() {
-            const loadingOverlay = document.getElementById('loadingOverlay');
-            const pdfEmbed = document.getElementById('pdfEmbed');
-            
-            try {
-                // First get the signed download URL from our server
-                const downloadResponse = await fetch('%s');
-                if (!downloadResponse.ok) {
-                    throw new Error('Failed to get download URL: ' + downloadResponse.statusText);
-                }
-                
-                // Get the actual signed S3 URL
-                const signedURL = downloadResponse.url;
-                
-                // Use our CORS proxy for the PDF
-                const proxyURL = '/pdf-proxy?url=' + encodeURIComponent(signedURL);
-                
-                // Set the PDF source and show it
-                pdfEmbed.src = proxyURL;
-                pdfEmbed.style.display = 'block';
-                
-                // Hide loading overlay after a short delay to allow PDF to start loading
-                setTimeout(() => {
-                    loadingOverlay.style.display = 'none';
-                }, 1500);
-                
-            } catch (error) {
-                console.error('Error loading PDF:', error);
-                loadingOverlay.innerHTML = '❌ Error loading PDF: ' + error.message + 
-                    '<br><br><a href="javascript:location.reload()">Try Again</a>';
-            }
-        }
-        
-        // Auto-load PDF when page loads
-        window.onload = function() {
-            loadPDF();
-        };
-    </script>
-</body>
-</html>`, fileName, fileName, downloadURL, downloadURL)
+	// Prepare data for template
+	data := struct {
+		FileName    string
+		DownloadURL string
+	}{
+		FileName:    fileName,
+		DownloadURL: downloadURL,
+	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprint(w, html)
+	if err := templates.ExecuteTemplate(w, "viewer.html", data); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
 }
 
 func pdfProxyHandler(w http.ResponseWriter, r *http.Request) {

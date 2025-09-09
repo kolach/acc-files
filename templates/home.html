@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Autodesk ACC File Lister - 2-Legged Authentication</title>
+</head>
+<body>
+    <h1>Autodesk ACC File Lister</h1>
+    <p><strong>Authentication Type:</strong> {{.AuthType}}</p>
+    <p><strong>Status:</strong> 
+        {{if .IsAuthenticated}}
+            ✅ <strong>Authenticated</strong> - Ready to browse files!
+        {{else}}
+            ❌ <strong>Not authenticated</strong> - Check your credentials
+        {{end}}
+    </p>
+    <hr>
+    <h2>How it works:</h2>
+    <ol>
+        <li><strong>Server-to-Server Auth:</strong> Uses client credentials (APS_CLIENT_ID + APS_CLIENT_SECRET)</li>
+        <li><strong>No user login required:</strong> App authenticates automatically on startup</li>
+        <li><strong>Token management:</strong> Automatically refreshes tokens when they expire</li>
+        <li><strong>Deployment ready:</strong> Perfect for server environments and automation</li>
+    </ol>
+    
+    {{if .IsAuthenticated}}
+        <p><a href="/projects">Browse Projects and Files</a></p>
+        <p><em>Application is authenticated and ready to access Autodesk APS APIs.</em></p>
+    {{else}}
+        <p><strong>Authentication failed.</strong> Please check your environment variables:</p>
+        <ul>
+            <li><code>APS_CLIENT_ID</code> - Your Autodesk APS Client ID</li>
+            <li><code>APS_CLIENT_SECRET</code> - Your Autodesk APS Client Secret</li>
+        </ul>
+    {{end}}
+    
+    <hr>
+    <p><a href="/token-status">View Token Status</a></p>
+    <p><small>2-legged authentication provides server-to-server access without requiring user authorization.</small></p>
+</body>
+</html>
