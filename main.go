@@ -8,6 +8,7 @@ import (
 	"html/template"
 	"io"
 	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -193,16 +194,23 @@ func formatTime(t time.Time) string {
 }
 
 func main() {
-	log.Printf("[STARTUP] Starting Autodesk ACC File Lister application...")
+	// Initialize JSON logger
+	jsonHandler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	})
+	logger := slog.New(jsonHandler)
+	slog.SetDefault(logger)
+
+	slog.Info("Starting Autodesk ACC File Lister application", "component", "startup")
 
 	// Initialize templates
 	initTemplates()
-	log.Printf("[STARTUP] Templates initialized")
+	slog.Info("Templates initialized", "component", "startup")
 
 	// Load .env file if it exists
 	err := godotenv.Load()
 	if err != nil {
-		log.Println("[STARTUP] No .env file found, using environment variables")
+		slog.Info("No .env file found, using environment variables", "component", "startup")
 	}
 
 	// Load configuration from environment variables
@@ -216,19 +224,26 @@ func main() {
 	}
 
 	if config.ClientID == "" || config.ClientSecret == "" {
-		log.Fatal("[STARTUP] FATAL: Please set APS_CLIENT_ID and APS_CLIENT_SECRET environment variables")
+		slog.Error("Missing required environment variables", 
+			"component", "startup", 
+			"error", "Please set APS_CLIENT_ID and APS_CLIENT_SECRET environment variables")
+		os.Exit(1)
 	}
 
 	if config.HubID == "" || config.ProjectID == "" {
-		log.Fatal("[STARTUP] FATAL: Please set APS_HUB_ID and APS_PROJECT_ID environment variables")
+		slog.Error("Missing required environment variables", 
+			"component", "startup", 
+			"error", "Please set APS_HUB_ID and APS_PROJECT_ID environment variables")
+		os.Exit(1)
 	}
 
-	log.Printf("[STARTUP] Configuration loaded:")
-	log.Printf("[STARTUP] - Client ID: %s***", config.ClientID[:8])
-	log.Printf("[STARTUP] - Redirect URI: %s", config.RedirectURI)
-	log.Printf("[STARTUP] - Port: %s", config.Port)
-	log.Printf("[STARTUP] - Hub ID: %s", config.HubID)
-	log.Printf("[STARTUP] - Project ID: %s", config.ProjectID)
+	slog.Info("Configuration loaded", 
+		"component", "startup",
+		"client_id_prefix", config.ClientID[:8]+"***",
+		"redirect_uri", config.RedirectURI,
+		"port", config.Port,
+		"hub_id", config.HubID,
+		"project_id", config.ProjectID)
 
 	// Set up HTTP routes
 	http.HandleFunc("/", homeHandler)
@@ -240,29 +255,33 @@ func main() {
 	http.HandleFunc("/viewer", viewerHandler)
 	http.HandleFunc("/pdf-proxy", pdfProxyHandler)
 
-	log.Printf("[STARTUP] Routes configured:")
-	log.Printf("[STARTUP] - / (home page)")
-	log.Printf("[STARTUP] - /projects (project listing)")
-	log.Printf("[STARTUP] - /files (file browser)")
-	log.Printf("[STARTUP] - /token-status (check token status)")
-	log.Printf("[STARTUP] - /versions (file versions)")
-	log.Printf("[STARTUP] - /download (file download)")
-	log.Printf("[STARTUP] - /viewer (PDF viewer)")
-	log.Printf("[STARTUP] - /pdf-proxy (CORS proxy for S3)")
+	slog.Info("Routes configured", 
+		"component", "startup",
+		"routes", []string{
+			"/ (home page)",
+			"/projects (project listing)", 
+			"/files (file browser)",
+			"/token-status (check token status)",
+			"/versions (file versions)",
+			"/download (file download)",
+			"/viewer (PDF viewer)",
+			"/pdf-proxy (CORS proxy for S3)",
+		})
 
 	// Get 2-legged authentication token
 	if authenticate2Legged() {
-		log.Printf("[STARTUP] ✅ 2-legged authentication successful!")
-		fmt.Printf("🔐 Authenticated using client credentials! Visit /projects to browse files\n")
+		slog.Info("2-legged authentication successful", "component", "startup", "status", "success", "message", "🔐 Authenticated using client credentials! Visit /projects to browse files")
 	} else {
-		log.Printf("[STARTUP] ❌ 2-legged authentication failed")
-		fmt.Printf("💥 Authentication failed! Check your APS_CLIENT_ID and APS_CLIENT_SECRET\n")
+		slog.Error("2-legged authentication failed", "component", "startup", "status", "failed", "message", "💥 Authentication failed! Check your APS_CLIENT_ID and APS_CLIENT_SECRET")
 	}
 
-	fmt.Printf("Server starting on port %s\n", config.Port)
-	fmt.Printf("Visit: http://localhost:%s\n", config.Port)
-	log.Printf("[STARTUP] Server ready and listening on port %s", config.Port)
-	log.Fatal(http.ListenAndServe(":"+config.Port, nil))
+	slog.Info("Server starting", "component", "startup", "port", config.Port, "url", "http://localhost:"+config.Port)
+	slog.Info("Server ready and listening", "component", "startup", "port", config.Port)
+	
+	if err := http.ListenAndServe(":"+config.Port, nil); err != nil {
+		slog.Error("Server failed to start", "component", "startup", "error", err)
+		os.Exit(1)
+	}
 }
 
 func homeHandler(w http.ResponseWriter, r *http.Request) {
@@ -281,20 +300,20 @@ func homeHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func projectsHandler(w http.ResponseWriter, r *http.Request) {
-	log.Printf("[HANDLER] Project page requested from %s", r.RemoteAddr)
+	slog.Info("Project page requested", "component", "handler", "remote_addr", r.RemoteAddr)
 
 	if token == nil {
-		log.Printf("[HANDLER] ERROR: User not authenticated")
+		slog.Error("User not authenticated", "component", "handler")
 		http.Error(w, "Not authenticated. Please get token first.", http.StatusUnauthorized)
 		return
 	}
 
-	log.Printf("[HANDLER] Fetching configured project: %s in hub: %s", config.ProjectID, config.HubID)
+	slog.Info("Fetching configured project", "component", "handler", "project_id", config.ProjectID, "hub_id", config.HubID)
 
 	// Get project details using hub ID and project ID
 	projectDetails, err := getProjectDetailsWithHub(config.HubID, config.ProjectID)
 	if err != nil {
-		log.Printf("[HANDLER] ERROR: Failed to get project details: %v", err)
+		slog.Error("Failed to get project details", "component", "handler", "error", err)
 		http.Error(w, fmt.Sprintf("Failed to get project details: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -302,12 +321,12 @@ func projectsHandler(w http.ResponseWriter, r *http.Request) {
 	// Get root folder for the project using hub ID
 	rootFolderID, err := getProjectRootFolder(config.HubID, config.ProjectID)
 	if err != nil {
-		log.Printf("[HANDLER] ERROR: Failed to get root folder: %v", err)
+		slog.Error("Failed to get root folder", "component", "handler", "error", err)
 		http.Error(w, fmt.Sprintf("Failed to get root folder: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	log.Printf("[HANDLER] Successfully retrieved project details and root folder")
+	slog.Info("Successfully retrieved project details and root folder", "component", "handler")
 
 	// Prepare data for template
 	type TemplateData struct {
@@ -549,10 +568,10 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func filesHandler(w http.ResponseWriter, r *http.Request) {
-	log.Printf("[HANDLER] Files page requested from %s", r.RemoteAddr)
+	slog.Info("Files page requested", "component", "handler", "remote_addr", r.RemoteAddr)
 
 	if token == nil {
-		log.Printf("[HANDLER] ERROR: User not authenticated")
+		slog.Error("User not authenticated", "component", "handler")
 		http.Error(w, "Not authenticated. Please get token first.", http.StatusUnauthorized)
 		return
 	}
@@ -663,14 +682,14 @@ func filesHandler(w http.ResponseWriter, r *http.Request) {
 
 // 2-legged authentication using client credentials
 func authenticate2Legged() bool {
-	log.Printf("[AUTH] Starting 2-legged authentication with client credentials")
+	slog.Info("Starting 2-legged authentication with client credentials", "component", "auth")
 
 	// First try to use stored token if it's still valid
 	stored, err := loadTokenFromDisk()
 	if err == nil {
 		// Check if current access token is still valid (with 5 minute buffer)
 		if stored.ExpiresAt > time.Now().Unix()+300 {
-			log.Printf("[AUTH] Using valid stored token")
+			slog.Info("Using valid stored token", "component", "auth")
 			token = &TokenResponse{
 				AccessToken: stored.AccessToken,
 				TokenType:   "Bearer",
@@ -681,10 +700,10 @@ func authenticate2Legged() bool {
 	}
 
 	// Get new token using client credentials
-	log.Printf("[AUTH] Getting new 2-legged token")
+	slog.Info("Getting new 2-legged token", "component", "auth")
 	newToken, err := getClientCredentialsToken()
 	if err != nil {
-		log.Printf("[AUTH] ERROR: Failed to get 2-legged token: %v", err)
+		slog.Error("Failed to get 2-legged token", "component", "auth", "error", err)
 		return false
 	}
 
@@ -693,29 +712,29 @@ func authenticate2Legged() bool {
 	// Save token to disk
 	err = saveTokenToDisk(newToken)
 	if err != nil {
-		log.Printf("[AUTH] WARNING: Failed to save token: %v", err)
+		slog.Warn("Failed to save token", "component", "auth", "error", err)
 	}
 
 	return true
 }
 
 func getClientCredentialsToken() (*TokenResponse, error) {
-	log.Printf("[AUTH] Requesting 2-legged token using client credentials")
+	slog.Info("Requesting 2-legged token using client credentials", "component", "auth")
 
 	// Step 1: Create Base64 encoded credentials (CLIENT_ID:CLIENT_SECRET)
 	credentials := fmt.Sprintf("%s:%s", config.ClientID, config.ClientSecret)
 	encodedCredentials := base64.StdEncoding.EncodeToString([]byte(credentials))
-	log.Printf("[AUTH] Created Base64 encoded credentials")
+	slog.Debug("Created Base64 encoded credentials", "component", "auth")
 
 	// Step 2: Prepare form data
 	data := url.Values{}
 	data.Set("grant_type", "client_credentials")
 	data.Set("scope", "data:read")
 
-	log.Printf("[AUTH] Making POST request to token endpoint")
+	slog.Info("Making POST request to token endpoint", "component", "auth")
 	req, err := http.NewRequest("POST", "https://developer.api.autodesk.com/authentication/v2/token", strings.NewReader(data.Encode()))
 	if err != nil {
-		log.Printf("[AUTH] ERROR: Failed to create token request: %v", err)
+		slog.Error("Failed to create token request", "component", "auth", "error", err)
 		return nil, err
 	}
 
@@ -727,38 +746,36 @@ func getClientCredentialsToken() (*TokenResponse, error) {
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Printf("[AUTH] ERROR: Token request failed: %v", err)
+		slog.Error("Token request failed", "component", "auth", "error", err)
 		return nil, err
 	}
 	defer resp.Body.Close()
 
-	log.Printf("[AUTH] Token response received with status: %d", resp.StatusCode)
+	slog.Info("Token response received", "component", "auth", "status_code", resp.StatusCode)
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		log.Printf("[AUTH] ERROR: Failed to read token response: %v", err)
+		slog.Error("Failed to read token response", "component", "auth", "error", err)
 		return nil, err
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		log.Printf("[AUTH] ERROR: Token request failed with HTTP %d: %s", resp.StatusCode, string(body))
+		slog.Error("Token request failed", "component", "auth", "status_code", resp.StatusCode, "response", string(body))
 		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
 	}
 
 	var tokenResp TokenResponse
 	err = json.Unmarshal(body, &tokenResp)
 	if err != nil {
-		log.Printf("[AUTH] ERROR: Failed to parse token response: %v", err)
+		slog.Error("Failed to parse token response", "component", "auth", "error", err)
 		return nil, err
 	}
 
-	log.Printf("[AUTH] 2-legged token obtained successfully (expires in %d seconds)", tokenResp.ExpiresIn)
+	slog.Info("2-legged token obtained successfully", "component", "auth", "expires_in", tokenResp.ExpiresIn)
 	return &tokenResp, nil
 }
 
 func makeAuthorizedRequest(url string) (*http.Response, error) {
-	log.Printf("[API] Making authorized request to: %s", url)
-
 	// Try request with current token first
 	resp, err := doAuthorizedRequest(url)
 	if err != nil {
@@ -767,13 +784,13 @@ func makeAuthorizedRequest(url string) (*http.Response, error) {
 
 	// If we get 401 (token expired), get a new token and retry once
 	if resp.StatusCode == 401 {
-		log.Printf("[API] Access token expired (401), getting new 2-legged token...")
+		slog.Info("Token expired, refreshing", "component", "api", "url", url)
 		resp.Body.Close() // Close the 401 response
 
 		// Get new token using client credentials
 		newToken, err := getClientCredentialsToken()
 		if err != nil {
-			log.Printf("[API] ERROR: Failed to get new 2-legged token: %v", err)
+			slog.Error("Failed to refresh token", "component", "api", "error", err)
 			return resp, nil // Return original 401 response
 		}
 
@@ -783,10 +800,8 @@ func makeAuthorizedRequest(url string) (*http.Response, error) {
 		// Save new token
 		saveErr := saveTokenToDisk(newToken)
 		if saveErr != nil {
-			log.Printf("[API] WARNING: Failed to save new token: %v", saveErr)
+			slog.Warn("Failed to save refreshed token", "component", "api", "error", saveErr)
 		}
-
-		log.Printf("[API] Successfully obtained new token, retrying request...")
 
 		// Retry the request with new token
 		return doAuthorizedRequest(url)
@@ -798,27 +813,23 @@ func makeAuthorizedRequest(url string) (*http.Response, error) {
 func doAuthorizedRequest(url string) (*http.Response, error) {
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		log.Printf("[API] ERROR: Failed to create request: %v", err)
+		slog.Error("Failed to create request", "component", "api", "error", err)
 		return nil, err
 	}
 
 	req.Header.Set("Authorization", "Bearer "+token.AccessToken)
-	log.Printf("[API] Using Bearer token: %s***", token.AccessToken[:20])
 
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Printf("[API] ERROR: Request failed: %v", err)
+		slog.Error("Request failed", "component", "api", "error", err, "url", url)
 		return nil, err
 	}
 
-	log.Printf("[API] Response received with status: %d", resp.StatusCode)
 	return resp, nil
 }
 
 func getHubs() (*HubsResponse, error) {
-	log.Printf("[API] Fetching user hubs...")
-
 	resp, err := makeAuthorizedRequest("https://developer.api.autodesk.com/project/v1/hubs")
 	if err != nil {
 		return nil, err
@@ -827,23 +838,22 @@ func getHubs() (*HubsResponse, error) {
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		log.Printf("[API] ERROR: Failed to read hubs response: %v", err)
+		slog.Error("Failed to read hubs response", "component", "api", "error", err)
 		return nil, err
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		log.Printf("[API] ERROR: Get hubs failed with HTTP %d: %s", resp.StatusCode, string(body))
+		slog.Error("Get hubs failed", "component", "api", "status_code", resp.StatusCode, "response", string(body))
 		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
 	}
 
 	var hubs HubsResponse
 	err = json.Unmarshal(body, &hubs)
 	if err != nil {
-		log.Printf("[API] ERROR: Failed to parse hubs response: %v", err)
+		slog.Error("Failed to parse hubs response", "component", "api", "error", err)
 		return nil, err
 	}
 
-	log.Printf("[API] Successfully retrieved %d hubs", len(hubs.Data))
 	return &hubs, err
 }
 
@@ -1089,8 +1099,6 @@ func getProjectRootFolder(hubID, projectID string) (string, error) {
 }
 
 func getFolderContents(projectID, folderID string) (*FolderContentsResponse, error) {
-	log.Printf("[API] Fetching folder contents for project %s, folder %s", projectID, folderID)
-
 	url := fmt.Sprintf("https://developer.api.autodesk.com/data/v1/projects/%s/folders/%s/contents", projectID, folderID)
 	resp, err := makeAuthorizedRequest(url)
 	if err != nil {
@@ -1100,29 +1108,29 @@ func getFolderContents(projectID, folderID string) (*FolderContentsResponse, err
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		log.Printf("[API] ERROR: Failed to read folder contents response: %v", err)
+		slog.Error("Failed to read folder contents response", "component", "api", "error", err)
 		return nil, err
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		log.Printf("[API] ERROR: Get folder contents failed with HTTP %d: %s", resp.StatusCode, string(body))
+		slog.Error("Get folder contents failed", "component", "api", "status_code", resp.StatusCode, "response", string(body))
 		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
 	}
+
+	// Log the full JSON response for analysis
+	slog.Info("Folder contents API response", "component", "api", "response_data", json.RawMessage(body))
 
 	var contents FolderContentsResponse
 	err = json.Unmarshal(body, &contents)
 	if err != nil {
-		log.Printf("[API] ERROR: Failed to parse folder contents response: %v", err)
+		slog.Error("Failed to parse folder contents response", "component", "api", "error", err)
 		return nil, err
 	}
 
-	log.Printf("[API] Successfully retrieved %d items from folder", len(contents.Data))
 	return &contents, err
 }
 
 func getItemVersions(projectID, itemID string) (*ItemVersionsResponse, error) {
-	log.Printf("[API] Fetching versions for item %s in project %s", itemID, projectID)
-
 	url := fmt.Sprintf("https://developer.api.autodesk.com/data/v1/projects/%s/items/%s/versions", projectID, itemID)
 	resp, err := makeAuthorizedRequest(url)
 	if err != nil {
@@ -1132,35 +1140,33 @@ func getItemVersions(projectID, itemID string) (*ItemVersionsResponse, error) {
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		log.Printf("[API] ERROR: Failed to read item versions response: %v", err)
+		slog.Error("Failed to read item versions response", "component", "api", "error", err)
 		return nil, err
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		log.Printf("[API] ERROR: Get item versions failed with HTTP %d: %s", resp.StatusCode, string(body))
+		slog.Error("Get item versions failed", "component", "api", "status_code", resp.StatusCode, "response", string(body))
 		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
 	}
+
+	// Log the full JSON response for analysis
+	slog.Info("Item versions API response", "component", "api", "response_data", json.RawMessage(body))
 
 	var versions ItemVersionsResponse
 	err = json.Unmarshal(body, &versions)
 	if err != nil {
-		log.Printf("[API] ERROR: Failed to parse item versions response: %v", err)
+		slog.Error("Failed to parse item versions response", "component", "api", "error", err)
 		return nil, err
 	}
 
-	log.Printf("[API] Successfully retrieved %d versions for item", len(versions.Data))
 	return &versions, nil
 }
 
 // Get version details with storage relationships
 func getVersionWithStorage(projectID, versionID string) (map[string]any, error) {
-	log.Printf("[API] Getting version details with storage for version %s in project %s", versionID, projectID)
-
 	// Use the versions endpoint to get detailed version info including storage
 	encodedVersionID := url.QueryEscape(versionID)
 	apiURL := fmt.Sprintf("https://developer.api.autodesk.com/data/v1/projects/%s/versions/%s", projectID, encodedVersionID)
-
-	log.Printf("[API] Requesting version details: %s", apiURL)
 
 	resp, err := makeAuthorizedRequest(apiURL)
 	if err != nil {
@@ -1170,25 +1176,25 @@ func getVersionWithStorage(projectID, versionID string) (map[string]any, error) 
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		log.Printf("[API] ERROR: Failed to read version details response: %v", err)
+		slog.Error("Failed to read version details response", "component", "api", "error", err)
 		return nil, err
 	}
 
-	log.Printf("[API] Version details response (status %d): %s", resp.StatusCode, string(body))
+	// Log the full JSON response for analysis
+	slog.Info("Version details API response", "component", "api", "status_code", resp.StatusCode, "response_data", json.RawMessage(body))
 
 	if resp.StatusCode != http.StatusOK {
-		log.Printf("[API] ERROR: Get version details failed with HTTP %d: %s", resp.StatusCode, string(body))
+		slog.Error("Get version details failed", "component", "api", "status_code", resp.StatusCode, "response", string(body))
 		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
 	}
 
 	var versionDetails map[string]any
 	err = json.Unmarshal(body, &versionDetails)
 	if err != nil {
-		log.Printf("[API] ERROR: Failed to parse version details response: %v", err)
+		slog.Error("Failed to parse version details response", "component", "api", "error", err)
 		return nil, err
 	}
 
-	log.Printf("[API] Successfully retrieved version details with storage")
 	return versionDetails, nil
 }
 
@@ -1397,7 +1403,9 @@ func getBatchCustomAttributes(projectID string, fileURNs []string) (map[string]a
 			return nil, err
 		}
 
-		log.Printf("[API] Batch response data: %+v", bimData)
+		// Format bimData as JSON for structured logging
+		bimDataJSON, _ := json.Marshal(bimData)
+		slog.Info("Batch response data received", "component", "api", "response_data", json.RawMessage(bimDataJSON))
 
 		// Parse the response to extract custom attributes for each file
 		if dataMap, ok := bimData.(map[string]any); ok {
@@ -1415,24 +1423,25 @@ func getBatchCustomAttributes(projectID string, fileURNs []string) (map[string]a
 						}
 
 						if customAttrs, exists := resultMap["customAttributes"]; exists {
-							log.Printf("[API] Found custom attributes for URN %s: %+v", urnID, customAttrs)
+							// Format customAttrs as JSON for structured logging
+							customAttrsJSON, _ := json.Marshal(customAttrs)
+							slog.Info("Found custom attributes for URN", "component", "api", "urn", urnID, "custom_attributes", json.RawMessage(customAttrsJSON))
 							result[urnID] = customAttrs
 						} else {
-							log.Printf("[API] No customAttributes field found for URN %s", urnID)
+							slog.Info("No customAttributes field found for URN", "component", "api", "urn", urnID)
 							result[urnID] = "No custom attributes"
 						}
 					}
 				}
 			} else {
-				log.Printf("[API] No 'results' array found in batch response")
+				slog.Warn("No 'results' array found in batch response", "component", "api")
 			}
 		}
 	} else {
-		log.Printf("[API] Batch request failed with HTTP %d: %s", bimResp.StatusCode, string(bimBody))
+		slog.Error("Batch request failed", "component", "api", "status_code", bimResp.StatusCode, "response", string(bimBody))
 		return nil, fmt.Errorf("HTTP %d: %s", bimResp.StatusCode, string(bimBody))
 	}
 
-	log.Printf("[API] Returning %d custom attribute sets", len(result))
 	return result, nil
 }
 
@@ -1498,7 +1507,7 @@ func saveTokenToDisk(tokenResp *TokenResponse) error {
 		ExpiresAt:   time.Now().Unix() + int64(tokenResp.ExpiresIn),
 	}
 
-	log.Printf("[TOKEN] Saving token - expires at: %s", time.Unix(stored.ExpiresAt, 0).Format("2006-01-02 15:04:05 MST"))
+	slog.Info("Saving token", "component", "token", "expires_at", time.Unix(stored.ExpiresAt, 0).Format("2006-01-02 15:04:05 MST"))
 
 	data, err := json.MarshalIndent(stored, "", "  ")
 	if err != nil {
